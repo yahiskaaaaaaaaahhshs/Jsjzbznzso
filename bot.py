@@ -7,6 +7,7 @@ import aiohttp
 import csv
 import io
 import random
+import weakref
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -14,7 +15,8 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 from telethon import TelegramClient
 from telethon.tl.functions.messages import GetHistoryRequest
 import sqlite3
-from asyncio import Semaphore, Lock
+from asyncio import Semaphore, Queue, TimeoutError
+import threading
 
 # ==================== CONFIG ====================
 TOKEN = "8735764992:AAEMKvlWXyruQj49KLz4IJHIDVU6ophL644"
@@ -25,48 +27,96 @@ API_ID = 29612794
 API_HASH = '6edc1a58a202c9f6e62dc98466932bad'
 OWNER_ID = 8129488947
 SESSION_DIR = "sessions"
-TIMEOUT_SECONDS = 15
+TIMEOUT_SECONDS = 8  # Reduced from 15
 MAX_SINGLE_LIMIT = 100
 MAX_MASS_LIMIT = 10
 MAX_MASS_CHECKS_PER_HOUR = 100
 SINGLE_WINDOW_HOURS = 1
 MASS_WINDOW_HOURS = 1
-MAX_CONCURRENT_CHECKS = 2
-SINGLE_CHECK_DELAY = 2
-MASS_COOLDOWN = 15
+MAX_CONCURRENT_CHECKS = 5  # Increased from 2
+SINGLE_CHECK_DELAY = 1  # Reduced from 2
+MASS_COOLDOWN = 10  # Reduced from 15
+CACHE_TTL = 300  # Cache results for 5 minutes
 
 if not os.path.exists(SESSION_DIR):
     os.makedirs(SESSION_DIR)
 
-# Clear sessions folder on start
-for f in os.listdir(SESSION_DIR):
+# Database with connection pooling
+class DatabasePool:
+    def __init__(self, db_path, pool_size=10):
+        self.db_path = db_path
+        self.pool_size = pool_size
+        self._pool = Queue(maxsize=pool_size)
+        self._lock = asyncio.Lock()
+        
+    async def initialize(self):
+        for _ in range(self.pool_size):
+            conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA synchronous=NORMAL')
+            conn.execute('PRAGMA cache_size=10000')
+            conn.execute('PRAGMA temp_store=MEMORY')
+            await self._pool.put(conn)
+    
+    async def get_connection(self):
+        return await self._pool.get()
+    
+    async def return_connection(self, conn):
+        await self._pool.put(conn)
+
+db_pool = DatabasePool('bot_data.db', pool_size=10)
+
+# Global variables
+sessions_queue = deque()
+session_clients = {}
+session_locks = {}
+user_cooldown = {}
+mass_checking_active = {}
+user_mass_cooldown = {}
+card_attempts = defaultdict(lambda: deque(maxlen=10))
+result_cache = {}
+cache_lock = asyncio.Lock()
+stats_lock = asyncio.Lock()
+
+# ==================== FAST DB OPERATIONS ====================
+async def execute_query(query, params=None, fetch_one=False, fetch_all=False):
+    conn = await db_pool.get_connection()
     try:
-        os.remove(os.path.join(SESSION_DIR, f))
-    except:
-        pass
+        cursor = conn.cursor()
+        if params:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
+        
+        if fetch_one:
+            result = cursor.fetchone()
+        elif fetch_all:
+            result = cursor.fetchall()
+        else:
+            result = None
+            conn.commit()
+        
+        return result
+    finally:
+        await db_pool.return_connection(conn)
 
-# Database
-conn = sqlite3.connect('bot_data.db', check_same_thread=False, timeout=30)
-c = conn.cursor()
-
-c.execute('PRAGMA journal_mode=WAL')
-c.execute('PRAGMA synchronous=NORMAL')
-
-c.execute('''CREATE TABLE IF NOT EXISTS sessions
+async def init_db():
+    conn = await db_pool.get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''CREATE TABLE IF NOT EXISTS sessions
              (id INTEGER PRIMARY KEY AUTOINCREMENT,
               session_name TEXT UNIQUE,
               phone_number TEXT,
               created_at TIMESTAMP,
-              is_active BOOLEAN DEFAULT 1,
-              is_busy BOOLEAN DEFAULT 0,
-              current_load INTEGER DEFAULT 0)''')
-
-c.execute('''CREATE TABLE IF NOT EXISTS banned_users
+              is_active BOOLEAN DEFAULT 1)''')
+        
+        cursor.execute('''CREATE TABLE IF NOT EXISTS banned_users
              (user_id INTEGER PRIMARY KEY,
               banned_until TIMESTAMP,
               reason TEXT)''')
-
-c.execute('''CREATE TABLE IF NOT EXISTS user_stats
+        
+        cursor.execute('''CREATE TABLE IF NOT EXISTS user_stats
              (user_id INTEGER PRIMARY KEY,
               first_name TEXT,
               username TEXT,
@@ -79,351 +129,314 @@ c.execute('''CREATE TABLE IF NOT EXISTS user_stats
               mass_last_reset TIMESTAMP,
               join_date TIMESTAMP,
               custom_limit INTEGER DEFAULT 0)''')
-
-c.execute('''CREATE TABLE IF NOT EXISTS bot_config
+        
+        cursor.execute('''CREATE TABLE IF NOT EXISTS bot_config
              (key TEXT PRIMARY KEY,
               value TEXT)''')
-
-c.execute('''CREATE TABLE IF NOT EXISTS admin_config
+        
+        cursor.execute('''CREATE TABLE IF NOT EXISTS admin_config
              (key TEXT PRIMARY KEY,
               value TEXT)''')
-
-c.execute('''CREATE TABLE IF NOT EXISTS approved_cards
+        
+        cursor.execute('''CREATE TABLE IF NOT EXISTS approved_cards
              (id INTEGER PRIMARY KEY AUTOINCREMENT,
               card_data TEXT,
               status TEXT,
               response TEXT,
               checked_at TIMESTAMP,
               checked_by INTEGER)''')
+        
+        cursor.execute("INSERT OR IGNORE INTO bot_config (key, value) VALUES ('check_delay', '1')")
+        cursor.execute("INSERT OR IGNORE INTO admin_config (key, value) VALUES ('approved_channel', '')")
+        conn.commit()
+    finally:
+        await db_pool.return_connection(conn)
 
-conn.commit()
-
-c.execute("INSERT OR IGNORE INTO bot_config (key, value) VALUES ('check_delay', '2')")
-c.execute("INSERT OR IGNORE INTO admin_config (key, value) VALUES ('approved_channel', '')")
-conn.commit()
-
-# Global variables
-sessions_queue = deque()
-session_semaphores = {}
-user_cooldown = {}
-mass_checking_active = {}
-user_mass_cooldown = {}
-card_attempts = defaultdict(list)
-
-# ==================== HELPER FUNCTIONS ====================
-
+# ==================== FAST HELPER FUNCTIONS ====================
 def is_owner(user_id):
     return user_id == OWNER_ID
 
-def get_user_limit(user_id):
-    if is_owner(user_id):
-        return 999999
-    try:
-        c.execute("SELECT custom_limit FROM user_stats WHERE user_id = ?", (user_id,))
-        result = c.fetchone()
-        if result and result[0] > 0:
-            return result[0]
-    except:
-        pass
-    return MAX_SINGLE_LIMIT
-
-def get_mass_limit(user_id):
-    if is_owner(user_id):
-        return 999999
-    return MAX_MASS_LIMIT
-
-def get_mass_hour_limit(user_id):
-    if is_owner(user_id):
-        return 999999
-    return MAX_MASS_CHECKS_PER_HOUR
-
-def is_banned(user_id):
-    try:
-        c.execute("SELECT banned_until, reason FROM banned_users WHERE user_id = ?", (user_id,))
-        result = c.fetchone()
-        if result:
-            banned_until = datetime.fromisoformat(result[0])
-            if banned_until > datetime.now():
-                return True, banned_until, result[1]
-            else:
-                c.execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
-                conn.commit()
-    except:
-        pass
+async def is_banned_fast(user_id):
+    result = await execute_query(
+        "SELECT banned_until, reason FROM banned_users WHERE user_id = ? AND banned_until > ?",
+        (user_id, datetime.now().isoformat()),
+        fetch_one=True
+    )
+    if result:
+        return True, datetime.fromisoformat(result[0]), result[1]
     return False, None, None
 
-def auto_ban_card(card_hash, user_id):
-    """Auto-ban user for 5 minutes if same card used 5 times in 2 minutes"""
+async def register_user_fast(user):
+    result = await execute_query(
+        "SELECT user_id FROM user_stats WHERE user_id = ?",
+        (user.id,),
+        fetch_one=True
+    )
+    if not result:
+        await execute_query(
+            "INSERT INTO user_stats (user_id, first_name, username, total_checks, join_date, single_last_reset, mass_last_reset) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user.id, user.first_name, user.username, 0, datetime.now().isoformat(), datetime.now().isoformat(), datetime.now().isoformat())
+        )
+
+async def get_user_limit_fast(user_id):
+    if is_owner(user_id):
+        return 999999
+    result = await execute_query(
+        "SELECT custom_limit FROM user_stats WHERE user_id = ?",
+        (user_id,),
+        fetch_one=True
+    )
+    if result and result[0] > 0:
+        return result[0]
+    return MAX_SINGLE_LIMIT
+
+async def update_single_stats_fast(user):
     now = datetime.now()
+    result = await execute_query(
+        "SELECT single_last_reset, single_checks_today FROM user_stats WHERE user_id = ?",
+        (user.id,),
+        fetch_one=True
+    )
+    
+    if result and result[0]:
+        last_reset = datetime.fromisoformat(result[0])
+        if now - last_reset > timedelta(hours=SINGLE_WINDOW_HOURS):
+            single_checks_today = 1
+        else:
+            single_checks_today = (result[1] or 0) + 1
+    else:
+        single_checks_today = 1
+    
+    await execute_query(
+        "UPDATE user_stats SET total_checks = total_checks + 1, single_checks_today = ?, single_last_reset = ?, first_name = ?, username = ? WHERE user_id = ?",
+        (single_checks_today, now.isoformat(), user.first_name, user.username, user.id)
+    )
+    return single_checks_today
+
+async def update_mass_stats_fast(user, count):
+    now = datetime.now()
+    result = await execute_query(
+        "SELECT mass_last_reset, mass_checks_today FROM user_stats WHERE user_id = ?",
+        (user.id,),
+        fetch_one=True
+    )
+    
+    if result and result[0]:
+        last_reset = datetime.fromisoformat(result[0])
+        if now - last_reset > timedelta(hours=MASS_WINDOW_HOURS):
+            mass_checks_today = count
+        else:
+            mass_checks_today = (result[1] or 0) + count
+    else:
+        mass_checks_today = count
+    
+    await execute_query(
+        "UPDATE user_stats SET total_checks = total_checks + ?, mass_checks_today = ?, mass_last_reset = ? WHERE user_id = ?",
+        (count, mass_checks_today, now.isoformat(), user.id)
+    )
+    return mass_checks_today
+
+async def get_single_check_count_fast(user_id):
+    result = await execute_query(
+        "SELECT single_checks_today FROM user_stats WHERE user_id = ?",
+        (user_id,),
+        fetch_one=True
+    )
+    return result[0] if result else 0
+
+async def get_mass_check_count_fast(user_id):
+    result = await execute_query(
+        "SELECT mass_checks_today FROM user_stats WHERE user_id = ?",
+        (user_id,),
+        fetch_one=True
+    )
+    return result[0] if result else 0
+
+async def get_delay_fast():
+    result = await execute_query(
+        "SELECT value FROM bot_config WHERE key = 'check_delay'",
+        fetch_one=True
+    )
+    return int(result[0]) if result else 1
+
+async def get_approved_channel_fast():
+    result = await execute_query(
+        "SELECT value FROM admin_config WHERE key = 'approved_channel'",
+        fetch_one=True
+    )
+    return result[0] if result else ""
+
+async def save_approved_card_fast(card_data, status, response, user_id):
+    await execute_query(
+        "INSERT INTO approved_cards (card_data, status, response, checked_at, checked_by) VALUES (?, ?, ?, ?, ?)",
+        (card_data, status, response, datetime.now().isoformat(), user_id)
+    )
+
+def auto_ban_card_fast(card_hash, user_id):
+    now = time.time()
     card_attempts[card_hash].append((now, user_id))
     
     # Clean old attempts
-    card_attempts[card_hash] = [(t, uid) for t, uid in card_attempts[card_hash] if now - t < timedelta(minutes=2)]
+    while card_attempts[card_hash] and now - card_attempts[card_hash][0][0] > 120:
+        card_attempts[card_hash].popleft()
     
     user_attempts = [uid for _, uid in card_attempts[card_hash] if uid == user_id]
     
     if len(user_attempts) >= 5:
-        banned_until = now + timedelta(minutes=5)
-        c.execute("INSERT OR REPLACE INTO banned_users (user_id, banned_until, reason) VALUES (?, ?, ?)",
-                  (user_id, banned_until.isoformat(), "Same card used 5 times within 2 minutes"))
-        conn.commit()
         return True
     return False
 
-def register_user(user):
-    try:
-        c.execute("SELECT user_id FROM user_stats WHERE user_id = ?", (user.id,))
-        if not c.fetchone():
-            c.execute("INSERT INTO user_stats (user_id, first_name, username, total_checks, join_date, single_last_reset, mass_last_reset) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                      (user.id, user.first_name, user.username, 0, datetime.now().isoformat(), datetime.now().isoformat(), datetime.now().isoformat()))
-            conn.commit()
-    except:
-        pass
-
-def update_single_stats(user):
-    try:
-        now = datetime.now()
-        c.execute("SELECT single_last_reset, single_checks_today FROM user_stats WHERE user_id = ?", (user.id,))
-        result = c.fetchone()
-        
-        if result and result[0]:
-            last_reset = datetime.fromisoformat(result[0])
-            if now - last_reset > timedelta(hours=SINGLE_WINDOW_HOURS):
-                single_checks_today = 1
-            else:
-                single_checks_today = (result[1] or 0) + 1
-        else:
-            single_checks_today = 1
-        
-        c.execute("UPDATE user_stats SET total_checks = total_checks + 1, single_checks_today = ?, single_last_reset = ?, first_name = ?, username = ? WHERE user_id = ?",
-                  (single_checks_today, now.isoformat(), user.first_name, user.username, user.id))
-        conn.commit()
-        return single_checks_today
-    except:
-        return 0
-
-def update_mass_stats(user, count):
-    try:
-        now = datetime.now()
-        c.execute("SELECT mass_last_reset, mass_checks_today FROM user_stats WHERE user_id = ?", (user.id,))
-        result = c.fetchone()
-        
-        if result and result[0]:
-            last_reset = datetime.fromisoformat(result[0])
-            if now - last_reset > timedelta(hours=MASS_WINDOW_HOURS):
-                mass_checks_today = count
-            else:
-                mass_checks_today = (result[1] or 0) + count
-        else:
-            mass_checks_today = count
-        
-        c.execute("UPDATE user_stats SET total_checks = total_checks + ?, mass_checks_today = ?, mass_last_reset = ? WHERE user_id = ?",
-                  (count, mass_checks_today, now.isoformat(), user.id))
-        conn.commit()
-        return mass_checks_today
-    except:
-        return 0
-
-def get_single_check_count(user_id):
-    try:
-        c.execute("SELECT single_checks_today FROM user_stats WHERE user_id = ?", (user_id,))
-        result = c.fetchone()
-        return result[0] if result else 0
-    except:
-        return 0
-
-def get_mass_check_count(user_id):
-    try:
-        c.execute("SELECT mass_checks_today FROM user_stats WHERE user_id = ?", (user_id,))
-        result = c.fetchone()
-        return result[0] if result else 0
-    except:
-        return 0
-
-def reset_user_checks(user_id):
-    try:
-        c.execute("UPDATE user_stats SET single_checks_today = 0, mass_checks_today = 0, single_last_reset = ?, mass_last_reset = ? WHERE user_id = ?", 
-                  (datetime.now().isoformat(), datetime.now().isoformat(), user_id))
-        conn.commit()
-    except:
-        pass
-
-def set_user_limit(user_id, limit):
-    try:
-        c.execute("UPDATE user_stats SET custom_limit = ? WHERE user_id = ?", (limit, user_id))
-        conn.commit()
-    except:
-        pass
-
-def get_all_stats():
-    try:
-        c.execute("SELECT COUNT(DISTINCT user_id), SUM(total_checks) FROM user_stats")
-        result = c.fetchone()
-        return result[0] or 0, result[1] or 0
-    except:
-        return 0, 0
-
-def get_delay():
-    try:
-        c.execute("SELECT value FROM bot_config WHERE key = 'check_delay'")
-        result = c.fetchone()
-        return int(result[0]) if result else 2
-    except:
-        return 2
-
-def set_delay(seconds):
-    try:
-        c.execute("UPDATE bot_config SET value = ? WHERE key = 'check_delay'", (str(seconds),))
-        conn.commit()
-    except:
-        pass
-
-def get_approved_channel():
-    try:
-        c.execute("SELECT value FROM admin_config WHERE key = 'approved_channel'")
-        result = c.fetchone()
-        return result[0] if result else ""
-    except:
-        return ""
-
-def set_approved_channel(channel_id):
-    try:
-        c.execute("INSERT OR REPLACE INTO admin_config (key, value) VALUES ('approved_channel', ?)", (channel_id,))
-        conn.commit()
-    except:
-        pass
-
-def save_approved_card(card_data, status, response, user_id):
-    try:
-        c.execute("INSERT INTO approved_cards (card_data, status, response, checked_at, checked_by) VALUES (?, ?, ?, ?, ?)",
-                  (card_data, status, response, datetime.now().isoformat(), user_id))
-        conn.commit()
-    except:
-        pass
-
-def load_sessions():
+# ==================== FAST SESSION MANAGEMENT ====================
+async def load_sessions_fast():
     global sessions_queue
-    try:
-        c.execute("SELECT session_name FROM sessions WHERE is_active = 1 ORDER BY id")
-        sessions = [row[0] for row in c.fetchall()]
-        sessions_queue = deque(sessions)
-        for session in sessions:
-            if session not in session_semaphores:
-                session_semaphores[session] = Semaphore(MAX_CONCURRENT_CHECKS)
-    except:
-        sessions_queue = deque()
-    return list(sessions_queue)
+    result = await execute_query(
+        "SELECT session_name FROM sessions WHERE is_active = 1 ORDER BY id",
+        fetch_all=True
+    )
+    sessions_queue = deque([row[0] for row in result])
+    
+    # Initialize session clients
+    for session_name in sessions_queue:
+        if session_name not in session_clients:
+            session_path = os.path.join(SESSION_DIR, session_name)
+            client = TelegramClient(session_path, API_ID, API_HASH)
+            await client.connect()
+            if await client.is_user_authorized():
+                session_clients[session_name] = client
+                session_locks[session_name] = asyncio.Lock()
+    
+    return len(sessions_queue)
 
-def get_next_session():
+def get_next_session_fast():
     if sessions_queue:
         session = sessions_queue[0]
         sessions_queue.rotate(-1)
         return session
     return None
 
-def add_session_to_queue(session_name):
-    if session_name not in sessions_queue:
-        sessions_queue.append(session_name)
-        if session_name not in session_semaphores:
-            session_semaphores[session_name] = Semaphore(MAX_CONCURRENT_CHECKS)
-
-def remove_session_from_queue(session_name):
-    if session_name in sessions_queue:
-        sessions_queue.remove(session_name)
-
-def clear_all_sessions():
-    global sessions_queue
+# ==================== FAST CARD CHECKING ====================
+async def send_card_via_session_fast(card_data, session_name):
+    """ULTRA FAST card checking with persistent session"""
+    
+    # Check cache first
+    cache_key = f"{card_data}"
+    async with cache_lock:
+        if cache_key in result_cache:
+            cached_time, cached_result = result_cache[cache_key]
+            if time.time() - cached_time < CACHE_TTL:
+                return cached_result
+    
+    client = session_clients.get(session_name)
+    if not client:
+        return {"error": "Session not connected", "status": "Error"}
+    
     try:
-        for f in os.listdir(SESSION_DIR):
-            if f.endswith('.session'):
-                try:
-                    os.remove(os.path.join(SESSION_DIR, f))
-                except:
-                    pass
-        c.execute("DELETE FROM sessions")
-        conn.commit()
-        sessions_queue = deque()
-        session_semaphores.clear()
-    except:
-        pass
+        async with session_locks[session_name]:
+            entity = await client.get_entity(f'@{BOT_USERNAME}')
+            message = f"{MESSAGE_PREFIX} {card_data}"
+            await client.send_message(entity, message)
+            
+            start_time = time.time()
+            
+            while time.time() - start_time < TIMEOUT_SECONDS:
+                await asyncio.sleep(0.5)  # Faster polling
+                
+                history = await client(GetHistoryRequest(
+                    peer=entity,
+                    limit=1,
+                    offset_date=None,
+                    offset_id=0,
+                    max_id=0,
+                    min_id=0,
+                    add_offset=0,
+                    hash=0
+                ))
+                
+                if history.messages:
+                    msg = history.messages[0]
+                    text = msg.message
+                    
+                    if 'CC:' in text or 'Status:' in text:
+                        # Fast parse
+                        status_match = re.search(r'Status:\s*(.*?)(?:\n|$)', text)
+                        response_match = re.search(r'Response:\s*(.*?)(?:\n|$)', text)
+                        bank_match = re.search(r'Bank:\s*(.*?)(?:\n|$)', text)
+                        type_match = re.search(r'Type:\s*(.*?)(?:\n|$)', text)
+                        country_match = re.search(r'Country:\s*(.*?)(?:\n|$)', text)
+                        
+                        result = {
+                            "cc": card_data,
+                            "status": status_match.group(1).strip() if status_match else "",
+                            "response": response_match.group(1).strip() if response_match else "",
+                            "gateway": "Stripe",
+                            "bank": bank_match.group(1).strip() if bank_match else "",
+                            "type": type_match.group(1).strip() if type_match else "",
+                            "country": country_match.group(1).strip() if country_match else ""
+                        }
+                        
+                        # Cache result
+                        async with cache_lock:
+                            result_cache[cache_key] = (time.time(), result)
+                        
+                        return result
+            
+            return {"error": "timeout", "status": "Error", "response": "No response"}
+            
+    except Exception as e:
+        return {"error": str(e), "status": "Error", "response": "Connection error"}
 
-def validate_and_parse_card(card_input):
-    """Flexible card validation supporting multiple formats"""
+def validate_card_fast(card_input):
+    """ULTRA FAST validation"""
     card_input = card_input.strip().replace(' ', '')
     
-    # Try format: cc|mm|yy|cvv or cc|mm|yyyy|cvv
-    if '|' in card_input or ':' in card_input:
-        if '|' in card_input:
-            parts = card_input.split('|')
-        else:
-            parts = card_input.split(':')
-        
-        if len(parts) >= 4:
-            card_num = parts[0].strip()
-            month = parts[1].strip().zfill(2)
-            year = parts[2].strip()
-            cvv = parts[3].strip()
-            
-            if len(year) == 4:
-                year = year[-2:]
-            elif len(year) == 2:
-                year = year
-            else:
-                return False, None
-            
-            year = year.zfill(2)
-            
-            if int(month) < 1 or int(month) > 12:
-                return False, None
-            
-            if re.match(r'^\d{15,16}$', card_num) and re.match(r'^\d{2}$', month) and re.match(r'^\d{2}$', year) and re.match(r'^\d{3,4}$', cvv):
-                return True, f"{card_num}|{month}|{year}|{cvv}"
-    
-    # Try continuous format: ccmmyycvv
-    match = re.search(r'^(\d{15,16})(\d{2})(\d{2})(\d{3,4})$', card_input)
+    # Check format cc|mm|yy|cvv
+    match = re.match(r'^(\d{15,16})\|(\d{1,2})\|(\d{2,4})\|(\d{3,4})$', card_input)
     if match:
         card_num = match.group(1)
         month = match.group(2).zfill(2)
-        year = match.group(3).zfill(2)
+        year = match.group(3)
         cvv = match.group(4)
         
-        if int(month) >= 1 and int(month) <= 12:
+        if len(year) == 4:
+            year = year[-2:]
+        year = year.zfill(2)
+        
+        if 1 <= int(month) <= 12:
             return True, f"{card_num}|{month}|{year}|{cvv}"
     
-    # Try continuous format with 4-digit year
-    match = re.search(r'^(\d{15,16})(\d{2})(\d{4})(\d{3,4})$', card_input)
+    # Check continuous format
+    match = re.match(r'^(\d{15,16})(\d{2})(\d{2,4})(\d{3,4})$', card_input)
     if match:
         card_num = match.group(1)
         month = match.group(2).zfill(2)
-        year = match.group(3)[-2:].zfill(2)
+        year = match.group(3)
         cvv = match.group(4)
         
-        if int(month) >= 1 and int(month) <= 12:
+        if len(year) == 4:
+            year = year[-2:]
+        year = year.zfill(2)
+        
+        if 1 <= int(month) <= 12:
             return True, f"{card_num}|{month}|{year}|{cvv}"
     
     return False, None
 
-def parse_multiple_cards(text):
-    """Parse multiple cards from text input - max 10 cards"""
+def parse_cards_fast(text):
+    """ULTRA FAST card parsing"""
     cards = []
-    
     lines = text.strip().split('\n')
     
-    for line in lines:
-        if len(cards) >= MAX_MASS_LIMIT:
-            break
-            
+    for line in lines[:MAX_MASS_LIMIT]:
         line = line.strip()
         if not line:
             continue
         
-        # Try format: cc|mm|yyyy|cvv
-        card_match = re.search(r'(\d{15,16})\s*[|:]\s*(\d{1,2})\s*[|:]\s*(\d{2,4})\s*[|:]\s*(\d{3,4})', line)
-        if card_match:
-            card_num = card_match.group(1)
-            month = card_match.group(2).zfill(2)
-            year = card_match.group(3)
-            cvv = card_match.group(4)
+        match = re.search(r'(\d{15,16})\s*[|:]\s*(\d{1,2})\s*[|:]\s*(\d{2,4})\s*[|:]\s*(\d{3,4})', line)
+        if match:
+            card_num = match.group(1)
+            month = match.group(2).zfill(2)
+            year = match.group(3)
+            cvv = match.group(4)
             
             if len(year) == 4:
                 year = year[-2:]
@@ -431,182 +444,44 @@ def parse_multiple_cards(text):
             
             if 1 <= int(month) <= 12:
                 cards.append(f"{card_num}|{month}|{year}|{cvv}")
-            continue
-        
-        # Try continuous format
-        cont_match = re.search(r'(\d{15,16})(\d{2})(\d{2,4})(\d{3,4})', line)
-        if cont_match:
-            card_num = cont_match.group(1)
-            month = cont_match.group(2).zfill(2)
-            year = cont_match.group(3)
-            cvv = cont_match.group(4)
-            
-            if len(year) == 4:
-                year = year[-2:]
-            year = year.zfill(2)
-            
-            if 1 <= int(month) <= 12:
-                cards.append(f"{card_num}|{month}|{year}|{cvv}")
-            continue
+                if len(cards) >= MAX_MASS_LIMIT:
+                    break
     
-    return cards[:MAX_MASS_LIMIT]
+    return cards
 
-def parse_bot_reply(text):
-    """Parse bot response and extract card info"""
-    cc_match = re.search(r'CC:\s*(.*?)(?:\n|$)', text)
-    status_match = re.search(r'Status:\s*(.*?)(?:\n|$)', text)
-    response_match = re.search(r'Response:\s*(.*?)(?:\n|$)', text)
-    gateway_match = re.search(r'Gateway:\s*(.*?)(?:\n|$)', text)
-    bank_match = re.search(r'Bank:\s*(.*?)(?:\n|$)', text)
-    type_match = re.search(r'Type:\s*(.*?)(?:\n|$)', text)
-    country_match = re.search(r'Country:\s*(.*?)(?:\n|$)', text)
+# ==================== BIN LOOKUP ====================
+bin_cache = {}
+async def get_bin_info_fast(bin_num):
+    if bin_num in bin_cache:
+        cached_time, cached_data = bin_cache[bin_num]
+        if time.time() - cached_time < 86400:  # Cache for 24 hours
+            return cached_data
     
-    status = status_match.group(1).strip() if status_match else ""
-    
-    return {
-        "cc": cc_match.group(1).strip() if cc_match else "",
-        "status": status,
-        "response": response_match.group(1).strip() if response_match else "",
-        "gateway": gateway_match.group(1).strip() if gateway_match else "Stripe",
-        "bank": bank_match.group(1).strip() if bank_match else "",
-        "type": type_match.group(1).strip() if type_match else "",
-        "country": country_match.group(1).strip() if country_match else ""
-    }
-
-def export_user_data():
-    try:
-        c.execute("SELECT user_id, first_name, username, total_checks, last_single_check, single_checks_today, mass_checks_today, join_date FROM user_stats")
-        users = c.fetchall()
-        
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(['User ID', 'First Name', 'Username', 'Total Checks', 'Last Check', 'Single Checks Today', 'Mass Checks Today', 'Join Date'])
-        writer.writerows(users)
-        
-        output.seek(0)
-        return output.getvalue()
-    except:
-        return ""
-
-def export_approved_cards():
-    try:
-        c.execute("SELECT card_data, status, response, checked_at, checked_by FROM approved_cards ORDER BY checked_at DESC")
-        cards = c.fetchall()
-        
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(['Card Data', 'Status', 'Response', 'Checked At', 'Checked By'])
-        writer.writerows(cards)
-        
-        output.seek(0)
-        return output.getvalue()
-    except:
-        return ""
-
-# ==================== ASYNC FUNCTIONS ====================
-
-async def get_bin_info(bin_num):
     try:
         async with aiohttp.ClientSession() as session:
             url = f"https://lookup.binlist.net/{bin_num}"
             async with session.get(url) as response:
                 if response.status == 200:
                     data = await response.json()
-                    
-                    country_name = data.get('country', {}).get('name', 'Unknown')
-                    scheme = data.get('scheme', 'Unknown').upper()
-                    card_type = data.get('type', 'Unknown').capitalize()
-                    
-                    bank = data.get('bank', {})
-                    bank_name = bank.get('name', 'Unknown')
-                    
-                    prepaid = data.get('prepaid', False)
-                    category = 'Prepaid' if prepaid else 'Standard'
-                    
-                    return {
+                    result = {
                         "bin": bin_num,
-                        "bank": bank_name,
-                        "brand": scheme,
-                        "category": category,
-                        "type": card_type,
-                        "country": country_name
+                        "bank": data.get('bank', {}).get('name', 'Unknown'),
+                        "brand": data.get('scheme', 'Unknown').upper(),
+                        "category": 'Prepaid' if data.get('prepaid', False) else 'Standard',
+                        "type": data.get('type', 'Unknown').capitalize(),
+                        "country": data.get('country', {}).get('name', 'Unknown')
                     }
+                    bin_cache[bin_num] = (time.time(), result)
+                    return result
                 else:
                     return {"error": "BIN not found"}
     except Exception as e:
         return {"error": f"API error: {str(e)}"}
 
-async def send_card_via_session(card_data, session_name):
-    """Send card to bot via Telethon session"""
-    session_path = os.path.join(SESSION_DIR, session_name)
-    
-    client = None
-    try:
-        client = TelegramClient(session_path, API_ID, API_HASH)
-        await client.connect()
-        
-        if not await client.is_user_authorized():
-            return {"error": "Session not authorized", "status": "Error"}
-        
-        entity = await client.get_entity(f'@{BOT_USERNAME}')
-        message = f"{MESSAGE_PREFIX} {card_data}"
-        await client.send_message(entity, message)
-        
-        start_time = time.time()
-        
-        while time.time() - start_time < TIMEOUT_SECONDS:
-            await asyncio.sleep(1.5)
-            
-            history = await client(GetHistoryRequest(
-                peer=entity,
-                limit=1,
-                offset_date=None,
-                offset_id=0,
-                max_id=0,
-                min_id=0,
-                add_offset=0,
-                hash=0
-            ))
-            
-            if history.messages:
-                msg = history.messages[0]
-                text = msg.message
-                
-                if 'CC:' in text or 'Status:' in text:
-                    parsed = parse_bot_reply(text)
-                    if parsed['status'] and parsed['status'] != '⏳':
-                        return parsed
-        
-        return {"error": "timeout", "status": "Error", "response": "No response from gateway"}
-        
-    except Exception as e:
-        return {"error": str(e), "status": "Error", "response": "Connection error"}
-    finally:
-        if client:
-            try:
-                await client.disconnect()
-            except:
-                pass
-
-async def verify_session_file(file_path):
-    try:
-        client = TelegramClient(file_path, API_ID, API_HASH)
-        await client.connect()
-        if await client.is_user_authorized():
-            me = await client.get_me()
-            await client.disconnect()
-            return True, me.phone if me.phone else "Unknown"
-        else:
-            await client.disconnect()
-            return False, "Session not authorized"
-    except Exception as e:
-        return False, str(e)
-
 # ==================== COMMAND HANDLERS ====================
-
 async def start(update: Update, context):
     user = update.effective_user
-    register_user(user)
+    await register_user_fast(user)
     
     keyboard = [[InlineKeyboardButton("Support", url="https://t.me/SoenxSupportBot")]]
     await update.message.reply_text(
@@ -618,9 +493,9 @@ async def start(update: Update, context):
 async def profile(update: Update, context):
     user = update.effective_user
     username = user.username if user.username else 'No username'
-    single_checks = get_single_check_count(user.id)
-    mass_checks = get_mass_check_count(user.id)
-    user_limit = get_user_limit(user.id)
+    single_checks = await get_single_check_count_fast(user.id)
+    mass_checks = await get_mass_check_count_fast(user.id)
+    user_limit = await get_user_limit_fast(user.id)
     
     keyboard = [[InlineKeyboardButton("Back", callback_data="back_to_cmds")]]
     
@@ -658,283 +533,216 @@ async def rules(update: Update, context):
 async def info(update: Update, context):
     await profile(update, context)
 
+# ==================== ULTRA FAST CHECK HANDLER ====================
 async def handle_chk_command(update: Update, context):
     user = update.effective_user
-    register_user(user)
+    await register_user_fast(user)
     
+    # Get card input
     card_input = None
-    
     if update.message.reply_to_message:
         card_input = update.message.reply_to_message.text
     elif context.args:
         card_input = ' '.join(context.args)
     else:
         await update.message.reply_text(
-            "<b>Usage:</b>\n"
-            "<code>/chk cc|mm|yyyy|cvv</code>\n\n"
-            "<b>Example:</b>\n"
-            "<code>/chk 4663490011245506|02|2027|453</code>",
+            "<b>Usage:</b>\n<code>/chk cc|mm|yyyy|cvv</code>\n\n<b>Example:</b>\n<code>/chk 4663490011245506|02|2027|453</code>",
             parse_mode="HTML"
         )
         return
     
-    is_valid, parsed_card = validate_and_parse_card(card_input)
-    
+    # Validate card
+    is_valid, parsed_card = validate_card_fast(card_input)
     if not is_valid:
         await update.message.reply_text(
-            "<b>Usage:</b>\n"
-            "<code>/chk cc|mm|yyyy|cvv</code>\n\n"
-            "<b>Example:</b>\n"
-            "<code>/chk 4663490011245506|02|2027|453</code>",
+            "<b>Usage:</b>\n<code>/chk cc|mm|yyyy|cvv</code>\n\n<b>Example:</b>\n<code>/chk 4663490011245506|02|2027|453</code>",
             parse_mode="HTML"
         )
         return
     
-    banned, until, reason = is_banned(user.id)
+    # Check ban
+    banned, until, reason = await is_banned_fast(user.id)
     if banned:
-        await update.message.reply_text(f"⛔ You are temporarily banned.\nReason: {reason}\nBanned until: {until.strftime('%Y-%m-%d %H:%M:%S')}")
+        await update.message.reply_text(f"⛔ Banned until: {until.strftime('%Y-%m-%d %H:%M:%S')}\nReason: {reason}")
         return
     
-    single_checks = get_single_check_count(user.id)
-    user_limit = get_user_limit(user.id)
-    
+    # Check limit
+    single_checks = await get_single_check_count_fast(user.id)
+    user_limit = await get_user_limit_fast(user.id)
     if single_checks >= user_limit and not is_owner(user.id):
-        await update.message.reply_text("⚠️ Limit reached (100 checks). Contact owner to reset your limit.")
+        await update.message.reply_text("⚠️ Limit reached (100 checks/hour).")
         return
     
+    # Cooldown
     current_time = time.time()
+    delay = await get_delay_fast()
     if user.id in user_cooldown:
         elapsed = current_time - user_cooldown[user.id]
-        delay = get_delay()
         if elapsed < delay:
-            wait_time = int(delay - elapsed)
-            await update.message.reply_text(f"⏳ Please wait {wait_time} seconds before next check.")
+            await update.message.reply_text(f"⏳ Wait {int(delay - elapsed)} seconds.")
             return
     
     user_cooldown[user.id] = current_time
     
+    # Auto-ban check
     card_hash = parsed_card.split('|')[0]
-    if auto_ban_card(card_hash, user.id):
-        await update.message.reply_text("⛔ You have been banned for 5 minutes for using the same card too many times.")
+    if auto_ban_card_fast(card_hash, user.id):
+        await update.message.reply_text("⛔ Banned for 5 minutes - too many attempts with same card.")
         return
     
-    if update.message.reply_to_message:
-        msg = await update.message.reply_to_message.reply_text("🔄 Processing... Please wait")
-    else:
-        msg = await update.message.reply_text("🔄 Processing... Please wait")
+    # Send processing message
+    msg = await update.message.reply_text("🔄 Processing...")
     
-    session_name = get_next_session()
-    
+    # Get session
+    session_name = get_next_session_fast()
     if not session_name:
-        await msg.edit_text("❌ No active session available. Owner please use /add to add a session.")
+        await msg.edit_text("❌ No active session.")
         return
     
-    async with session_semaphores.get(session_name, Semaphore(1)):
-        result = await send_card_via_session(parsed_card, session_name)
+    # Check card
+    result = await send_card_via_session_fast(parsed_card, session_name)
     
+    # Format response
     if "error" in result:
-        if result.get("error") == "timeout":
-            formatted = (
-                f"<b>☇ CC:</b> {parsed_card}\n"
-                f"<b>ヾ⌿ Status:</b> Error\n"
-                f"<b>ヾ⌿ Response:</b> No response from gateway\n"
-                f"<b>· · · · · · · · · · · · · · ·</b>\n"
-                f"<b>ヾ⌿ Bank:</b> N/A\n"
-                f"<b>ヾ⌿ Type:</b> N/A\n"
-                f"<b>ヾ⌿ Country:</b> N/A\n"
-                f"<b>· · · · · · · · · · · · · · ·</b>\n"
-                f"<b>ヾ⌿ Checked By:</b> <a href='tg://user?id={user.id}'>{user.first_name}</a> (<code>{user.id}</code>)"
-            )
-        else:
-            formatted = f"<b>❌ Error:</b> {result.get('error', 'Unknown error')}"
+        formatted = (
+            f"<b>☇ CC:</b> {parsed_card}\n"
+            f"<b>ヾ⌿ Status:</b> Error\n"
+            f"<b>ヾ⌿ Response:</b> {result.get('error', 'Unknown')}\n"
+            f"<b>· · · · · · · · · · · · · · ·</b>\n"
+            f"<b>ヾ⌿ Checked By:</b> <a href='tg://user?id={user.id}'>{user.first_name}</a>"
+        )
+    else:
+        formatted = (
+            f"<b>☇ CC:</b> {result.get('cc', parsed_card)}\n"
+            f"<b>ヾ⌿ Status:</b> {result.get('status', 'N/A')}\n"
+            f"<b>ヾ⌿ Response:</b> {result.get('response', 'N/A')}\n"
+            f"<b>· · · · · · · · · · · · · · ·</b>\n"
+            f"<b>ヾ⌿ Bank:</b> {result.get('bank', 'N/A')}\n"
+            f"<b>ヾ⌿ Type:</b> {result.get('type', 'N/A')}\n"
+            f"<b>ヾ⌿ Country:</b> {result.get('country', 'N/A')}\n"
+            f"<b>· · · · · · · · · · · · · · ·</b>\n"
+            f"<b>ヾ⌿ Gate:</b> Stripe\n"
+            f"<b>ヾ⌿ Checked By:</b> <a href='tg://user?id={user.id}'>{user.first_name}</a>"
+        )
         
-        await msg.edit_text(formatted, parse_mode="HTML")
-        return
-    
-    is_approved = 'approved' in result.get('status', '').lower()
-    
-    if is_approved:
-        save_approved_card(parsed_card, result.get('status', ''), result.get('response', ''), user.id)
-        approved_channel = get_approved_channel()
-        if approved_channel:
-            try:
-                await context.bot.send_message(
-                    approved_channel,
-                    f"<b>☇ CC:</b> {parsed_card}\n"
-                    f"<b>ヾ⌿ Status:</b> {result.get('status', 'N/A')}\n"
-                    f"<b>ヾ⌿ Response:</b> {result.get('response', 'N/A')}\n"
-                    f"<b>· · · · · · · · · · · · · · ·</b>\n"
-                    f"<b>ヾ⌿ Bank:</b> {result.get('bank', 'N/A')}\n"
-                    f"<b>ヾ⌿ Type:</b> {result.get('type', 'N/A')}\n"
-                    f"<b>ヾ⌿ Country:</b> {result.get('country', 'N/A')}",
-                    parse_mode="HTML"
-                )
-            except:
-                pass
-    
-    formatted = (
-        f"<b>☇ CC:</b> {result.get('cc', parsed_card)}\n"
-        f"<b>ヾ⌿ Status:</b> {result.get('status', 'N/A')}\n"
-        f"<b>ヾ⌿ Response:</b> {result.get('response', 'N/A')}\n"
-        f"<b>· · · · · · · · · · · · · · ·</b>\n"
-        f"<b>ヾ⌿ Bank:</b> {result.get('bank', 'N/A')}\n"
-        f"<b>ヾ⌿ Type:</b> {result.get('type', 'N/A')}\n"
-        f"<b>ヾ⌿ Country:</b> {result.get('country', 'N/A')}\n"
-        f"<b>· · · · · · · · · · · · · · ·</b>\n"
-        f"<b>ヾ⌿ Gate:</b> Stripe\n"
-        f"<b>ヾ⌿ Checked By:</b> <a href='tg://user?id={user.id}'>{user.first_name}</a> (<code>{user.id}</code>)"
-    )
+        # Save approved cards
+        if 'approved' in result.get('status', '').lower():
+            await save_approved_card_fast(parsed_card, result.get('status', ''), result.get('response', ''), user.id)
+            channel = await get_approved_channel_fast()
+            if channel:
+                try:
+                    await context.bot.send_message(channel, formatted, parse_mode="HTML")
+                except:
+                    pass
     
     await msg.edit_text(formatted, parse_mode="HTML")
-    update_single_stats(user)
+    await update_single_stats_fast(user)
 
 async def handle_ss_command(update: Update, context):
+    """Same as chk but with different gateway display"""
     user = update.effective_user
-    register_user(user)
+    await register_user_fast(user)
     
     card_input = None
-    
     if update.message.reply_to_message:
         card_input = update.message.reply_to_message.text
     elif context.args:
         card_input = ' '.join(context.args)
     else:
         await update.message.reply_text(
-            "<b>Usage:</b>\n"
-            "<code>/ss cc|mm|yyyy|cvv</code>\n\n"
-            "<b>Example:</b>\n"
-            "<code>/ss 4663490011245506|02|2027|453</code>",
+            "<b>Usage:</b>\n<code>/ss cc|mm|yyyy|cvv</code>\n\n<b>Example:</b>\n<code>/ss 4663490011245506|02|2027|453</code>",
             parse_mode="HTML"
         )
         return
     
-    is_valid, parsed_card = validate_and_parse_card(card_input)
-    
+    is_valid, parsed_card = validate_card_fast(card_input)
     if not is_valid:
         await update.message.reply_text(
-            "<b>Usage:</b>\n"
-            "<code>/ss cc|mm|yyyy|cvv</code>\n\n"
-            "<b>Example:</b>\n"
-            "<code>/ss 4663490011245506|02|2027|453</code>",
+            "<b>Usage:</b>\n<code>/ss cc|mm|yyyy|cvv</code>\n\n<b>Example:</b>\n<code>/ss 4663490011245506|02|2027|453</code>",
             parse_mode="HTML"
         )
         return
     
-    banned, until, reason = is_banned(user.id)
+    banned, until, reason = await is_banned_fast(user.id)
     if banned:
-        await update.message.reply_text(f"⛔ You are temporarily banned.\nReason: {reason}\nBanned until: {until.strftime('%Y-%m-%d %H:%M:%S')}")
+        await update.message.reply_text(f"⛔ Banned until: {until.strftime('%Y-%m-%d %H:%M:%S')}")
         return
     
-    single_checks = get_single_check_count(user.id)
-    user_limit = get_user_limit(user.id)
-    
+    single_checks = await get_single_check_count_fast(user.id)
+    user_limit = await get_user_limit_fast(user.id)
     if single_checks >= user_limit and not is_owner(user.id):
-        await update.message.reply_text("⚠️ Limit reached (100 checks). Contact owner to reset your limit.")
+        await update.message.reply_text("⚠️ Limit reached.")
         return
     
     current_time = time.time()
+    delay = await get_delay_fast()
     if user.id in user_cooldown:
         elapsed = current_time - user_cooldown[user.id]
-        delay = get_delay()
         if elapsed < delay:
-            wait_time = int(delay - elapsed)
-            await update.message.reply_text(f"⏳ Please wait {wait_time} seconds before next check.")
+            await update.message.reply_text(f"⏳ Wait {int(delay - elapsed)} seconds.")
             return
     
     user_cooldown[user.id] = current_time
     
     card_hash = parsed_card.split('|')[0]
-    if auto_ban_card(card_hash, user.id):
-        await update.message.reply_text("⛔ You have been banned for 5 minutes for using the same card too many times.")
+    if auto_ban_card_fast(card_hash, user.id):
+        await update.message.reply_text("⛔ Banned for 5 minutes.")
         return
     
-    if update.message.reply_to_message:
-        msg = await update.message.reply_to_message.reply_text("🔄 Processing... Please wait")
-    else:
-        msg = await update.message.reply_text("🔄 Processing... Please wait")
+    msg = await update.message.reply_text("🔄 Processing...")
     
-    session_name = get_next_session()
-    
+    session_name = get_next_session_fast()
     if not session_name:
-        await msg.edit_text("❌ No active session available. Owner please use /add to add a session.")
+        await msg.edit_text("❌ No active session.")
         return
     
-    async with session_semaphores.get(session_name, Semaphore(1)):
-        result = await send_card_via_session(parsed_card, session_name)
+    result = await send_card_via_session_fast(parsed_card, session_name)
     
     if "error" in result:
-        if result.get("error") == "timeout":
-            formatted = (
-                f"<b>☇ CC:</b> {parsed_card}\n"
-                f"<b>ヾ⌿ Status:</b> Error\n"
-                f"<b>ヾ⌿ Response:</b> No response from gateway\n"
-                f"<b>· · · · · · · · · · · · · · ·</b>\n"
-                f"<b>ヾ⌿ Bank:</b> N/A\n"
-                f"<b>ヾ⌿ Type:</b> N/A\n"
-                f"<b>ヾ⌿ Country:</b> N/A\n"
-                f"<b>· · · · · · · · · · · · · · ·</b>\n"
-                f"<b>ヾ⌿ Checked By:</b> <a href='tg://user?id={user.id}'>{user.first_name}</a> (<code>{user.id}</code>)"
-            )
-        else:
-            formatted = f"<b>❌ Error:</b> {result.get('error', 'Unknown error')}"
+        formatted = (
+            f"<b>☇ CC:</b> {parsed_card}\n"
+            f"<b>ヾ⌿ Status:</b> Error\n"
+            f"<b>ヾ⌿ Response:</b> {result.get('error', 'Unknown')}\n"
+            f"<b>· · · · · · · · · · · · · · ·</b>\n"
+            f"<b>ヾ⌿ Checked By:</b> <a href='tg://user?id={user.id}'>{user.first_name}</a>"
+        )
+    else:
+        formatted = (
+            f"<b>☇ CC:</b> {result.get('cc', parsed_card)}\n"
+            f"<b>ヾ⌿ Status:</b> {result.get('status', 'N/A')}\n"
+            f"<b>ヾ⌿ Response:</b> {result.get('response', 'N/A')}\n"
+            f"<b>· · · · · · · · · · · · · · ·</b>\n"
+            f"<b>ヾ⌿ Bank:</b> {result.get('bank', 'N/A')}\n"
+            f"<b>ヾ⌿ Type:</b> {result.get('type', 'N/A')}\n"
+            f"<b>ヾ⌿ Country:</b> {result.get('country', 'N/A')}\n"
+            f"<b>· · · · · · · · · · · · · · ·</b>\n"
+            f"<b>ヾ⌿ Gate:</b> Stripe+Square $0.001(trail)\n"
+            f"<b>ヾ⌿ Checked By:</b> <a href='tg://user?id={user.id}'>{user.first_name}</a>"
+        )
         
-        await msg.edit_text(formatted, parse_mode="HTML")
-        return
-    
-    is_approved = 'approved' in result.get('status', '').lower()
-    
-    if is_approved:
-        save_approved_card(parsed_card, result.get('status', ''), result.get('response', ''), user.id)
-        approved_channel = get_approved_channel()
-        if approved_channel:
-            try:
-                await context.bot.send_message(
-                    approved_channel,
-                    f"<b>☇ CC:</b> {parsed_card}\n"
-                    f"<b>ヾ⌿ Status:</b> {result.get('status', 'N/A')}\n"
-                    f"<b>ヾ⌿ Response:</b> {result.get('response', 'N/A')}\n"
-                    f"<b>· · · · · · · · · · · · · · ·</b>\n"
-                    f"<b>ヾ⌿ Bank:</b> {result.get('bank', 'N/A')}\n"
-                    f"<b>ヾ⌿ Type:</b> {result.get('type', 'N/A')}\n"
-                    f"<b>ヾ⌿ Country:</b> {result.get('country', 'N/A')}",
-                    parse_mode="HTML"
-                )
-            except:
-                pass
-    
-    formatted = (
-        f"<b>☇ CC:</b> {result.get('cc', parsed_card)}\n"
-        f"<b>ヾ⌿ Status:</b> {result.get('status', 'N/A')}\n"
-        f"<b>ヾ⌿ Response:</b> {result.get('response', 'N/A')}\n"
-        f"<b>· · · · · · · · · · · · · · ·</b>\n"
-        f"<b>ヾ⌿ Bank:</b> {result.get('bank', 'N/A')}\n"
-        f"<b>ヾ⌿ Type:</b> {result.get('type', 'N/A')}\n"
-        f"<b>ヾ⌿ Country:</b> {result.get('country', 'N/A')}\n"
-        f"<b>· · · · · · · · · · · · · · ·</b>\n"
-        f"<b>ヾ⌿ Gate:</b> Stripe+Square $0.001(trail)\n"
-        f"<b>ヾ⌿ Checked By:</b> <a href='tg://user?id={user.id}'>{user.first_name}</a> (<code>{user.id}</code>)"
-    )
+        if 'approved' in result.get('status', '').lower():
+            await save_approved_card_fast(parsed_card, result.get('status', ''), result.get('response', ''), user.id)
     
     await msg.edit_text(formatted, parse_mode="HTML")
-    update_single_stats(user)
+    await update_single_stats_fast(user)
 
 async def handle_mchk_command(update: Update, context):
+    """ULTRA FAST mass check"""
     user = update.effective_user
-    register_user(user)
+    await register_user_fast(user)
     
     if user.id in mass_checking_active and mass_checking_active[user.id]:
-        await update.message.reply_text("⏳ You already have an active mass check. Please wait for it to complete.\nAfter complete, wait 15 seconds before starting new mass check.", parse_mode="HTML")
+        await update.message.reply_text("⏳ Active mass check. Please wait.")
         return
     
     if user.id in user_mass_cooldown:
         elapsed = time.time() - user_mass_cooldown[user.id]
         if elapsed < MASS_COOLDOWN:
-            wait_time = int(MASS_COOLDOWN - elapsed)
-            await update.message.reply_text(f"⏳ Please wait {wait_time} seconds before starting a new mass check.", parse_mode="HTML")
+            await update.message.reply_text(f"⏳ Wait {int(MASS_COOLDOWN - elapsed)} seconds.")
             return
     
+    # Get cards
     card_text = None
-    
     if update.message.reply_to_message:
         if update.message.reply_to_message.document:
             file = await context.bot.get_file(update.message.reply_to_message.document.file_id)
@@ -946,190 +754,129 @@ async def handle_mchk_command(update: Update, context):
         card_text = ' '.join(context.args)
     else:
         await update.message.reply_text(
-            "<b>Usage:</b>\n"
-            "<code>/mchk</code> (reply to message with cards or send cards in command)\n\n"
-            "<b>Format:</b>\n"
-            "<code>cc|mm|yyyy|cvv</code>\n"
-            "<code>cc|mm|yyyy|cvv</code>\n\n"
-            "<b>Max 10 cards per mass check</b>",
+            "<b>Usage:</b>\n<code>/mchk</code> (reply to message with cards)\n\n<b>Format:</b>\n<code>cc|mm|yyyy|cvv</code> (one per line)\n<b>Max 10 cards</b>",
             parse_mode="HTML"
         )
         return
     
-    cards = parse_multiple_cards(card_text)
-    
+    cards = parse_cards_fast(card_text)
     if not cards:
-        await update.message.reply_text("❌ No valid cards found. Use format: cc|mm|yyyy|cvv (one per line)", parse_mode="HTML")
+        await update.message.reply_text("❌ No valid cards found.")
         return
     
     if len(cards) > MAX_MASS_LIMIT:
-        await update.message.reply_text(f"❌ Max {MAX_MASS_LIMIT} cards per mass check. You sent {len(cards)} cards.\nFirst {MAX_MASS_LIMIT} cards will be checked.", parse_mode="HTML")
         cards = cards[:MAX_MASS_LIMIT]
     
-    banned, until, reason = is_banned(user.id)
+    # Check ban and limits
+    banned, until, reason = await is_banned_fast(user.id)
     if banned:
-        await update.message.reply_text(f"⛔ You are temporarily banned.\nReason: {reason}\nBanned until: {until.strftime('%Y-%m-%d %H:%M:%S')}")
+        await update.message.reply_text(f"⛔ Banned")
         return
     
-    mass_checks_done = get_mass_check_count(user.id)
-    mass_hour_limit = get_mass_hour_limit(user.id)
-    
-    if mass_checks_done + len(cards) > mass_hour_limit and not is_owner(user.id):
-        remaining = mass_hour_limit - mass_checks_done
-        await update.message.reply_text(
-            f"⚠️ Limit reached! You have {remaining} mass checks remaining this hour.\nMax 100 cards total in mass checks per hour.",
-            parse_mode="HTML"
-        )
+    mass_checks_done = await get_mass_check_count_fast(user.id)
+    if mass_checks_done + len(cards) > MAX_MASS_CHECKS_PER_HOUR and not is_owner(user.id):
+        await update.message.reply_text(f"⚠️ Limit reached. {MAX_MASS_CHECKS_PER_HOUR - mass_checks_done} remaining.")
         return
     
     if not sessions_queue:
-        await update.message.reply_text("❌ No active sessions available. Owner please use /add to add a session.")
+        await update.message.reply_text("❌ No active sessions.")
         return
     
     mass_checking_active[user.id] = True
-    
-    status_msg = await update.message.reply_text(
-        f"<b>Cards:</b> {len(cards)}\n"
-        f"<b>Checking:</b> 0/{len(cards)}\n"
-        f"<b>Remaining:</b> {len(cards)}\n"
-        f"<b>Checked:</b> 0\n"
-        f"<b>Approved:</b> 0\n"
-        f"<b>Declined:</b> 0\n"
-        f"<b>Error:</b> 0\n\n"
-        f"<b>🔄 Mass check started...</b>",
-        parse_mode="HTML"
-    )
+    status_msg = await update.message.reply_text(f"🔄 Mass checking {len(cards)} cards...")
     
     results = []
-    approved_cards = []
-    declined_cards = []
-    error_cards = []
-    checked = 0
+    approved = []
+    declined = []
+    errors = []
     
-    for i, card in enumerate(cards):
-        if user.id not in mass_checking_active or not mass_checking_active[user.id]:
-            await status_msg.edit_text("⏹️ Mass check cancelled by user.", parse_mode="HTML")
-            break
+    # Process cards in parallel batches
+    batch_size = MAX_CONCURRENT_CHECKS
+    for i in range(0, len(cards), batch_size):
+        batch = cards[i:i+batch_size]
+        tasks = []
         
-        card_hash = card.split('|')[0]
-        if auto_ban_card(card_hash, user.id):
-            results.append({"card": card, "status": "Banned", "response": "User banned for same card spam"})
-            error_cards.append(card)
-        else:
-            session_name = get_next_session()
-            if not session_name:
-                results.append({"card": card, "status": "Error", "response": "No session available"})
-                error_cards.append(card)
+        for card in batch:
+            session_name = get_next_session_fast()
+            if session_name:
+                tasks.append(send_card_via_session_fast(card, session_name))
             else:
-                async with session_semaphores.get(session_name, Semaphore(1)):
-                    result = await send_card_via_session(card, session_name)
+                tasks.append(asyncio.sleep(0, result={"error": "No session"}))
+        
+        batch_results = await asyncio.gather(*tasks)
+        
+        for card, result in zip(batch, batch_results):
+            if "error" in result:
+                errors.append(card)
+                results.append({"card": card, "status": "Error", "response": result.get('error', 'Unknown')})
+            else:
+                results.append({
+                    "card": card,
+                    "status": result.get('status', 'N/A'),
+                    "response": result.get('response', 'N/A')
+                })
                 
-                if "error" in result:
-                    results.append({"card": card, "status": "Error", "response": result.get('error', 'Unknown')})
-                    error_cards.append(card)
+                if 'approved' in result.get('status', '').lower():
+                    approved.append(card)
+                    await save_approved_card_fast(card, result.get('status', ''), result.get('response', ''), user.id)
+                elif 'declined' in result.get('status', '').lower():
+                    declined.append(card)
                 else:
-                    results.append({
-                        "card": card,
-                        "status": result.get('status', 'N/A'),
-                        "response": result.get('response', 'N/A'),
-                        "bank": result.get('bank', 'N/A'),
-                        "type": result.get('type', 'N/A'),
-                        "country": result.get('country', 'N/A')
-                    })
-                    
-                    if 'approved' in result.get('status', '').lower():
-                        approved_cards.append(card)
-                        save_approved_card(card, result.get('status', ''), result.get('response', ''), user.id)
-                    elif 'declined' in result.get('status', '').lower():
-                        declined_cards.append(card)
-                    else:
-                        error_cards.append(card)
+                    errors.append(card)
         
-        checked = i + 1
-        remaining = len(cards) - checked
-        
-        await status_msg.edit_text(
-            f"<b>Cards:</b> {len(cards)}\n"
-            f"<b>Checking:</b> {checked}/{len(cards)}\n"
-            f"<b>Remaining:</b> {remaining}\n"
-            f"<b>Checked:</b> {checked}\n"
-            f"<b>Approved:</b> {len(approved_cards)}\n"
-            f"<b>Declined:</b> {len(declined_cards)}\n"
-            f"<b>Error:</b> {len(error_cards)}\n\n"
-            f"<b>🔄 Checking card {checked}/{len(cards)}...</b>",
-            parse_mode="HTML"
-        )
-        
-        await asyncio.sleep(0.5)
+        # Update progress
+        await status_msg.edit_text(f"✅ Checked {min(i+batch_size, len(cards))}/{len(cards)}\nApproved: {len(approved)}\nDeclined: {len(declined)}\nError: {len(errors)}")
     
-    result_text = f"<b>☇ Mass Check Results</b>\n"
-    result_text += f"<b>· · · · · · · · · · · · · · ·</b>\n"
-    
-    for idx, res in enumerate(results):
+    # Send results
+    result_text = f"<b>☇ Mass Check Results</b>\n<b>· · · · · · · · · · · · · · ·</b>\n"
+    for idx, res in enumerate(results[:20]):
         result_text += f"\n<b>☇ CC:</b> <code>{res['card']}</code>  {idx+1}\n"
         result_text += f"<b>ヾ⌿ Status:</b> {res.get('status', 'N/A')}\n"
-        result_text += f"<b>ヾ⌿ Response:</b> {res.get('response', 'N/A')}\n"
         result_text += f"<b>· · · · · · · · · · · · · · ·</b>\n"
     
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     
-    if approved_cards:
-        approved_file = io.BytesIO('\n'.join(approved_cards).encode('utf-8'))
-        await update.message.reply_document(document=approved_file, filename=f"@Soenx_app_{timestamp}.txt", caption=f"✅ Approved Cards ({len(approved_cards)})")
-    
-    if declined_cards:
-        declined_file = io.BytesIO('\n'.join(declined_cards).encode('utf-8'))
-        await update.message.reply_document(document=declined_file, filename=f"@Soenx_dec_{timestamp}.txt", caption=f"❌ Declined Cards ({len(declined_cards)})")
-    
-    if error_cards:
-        error_file = io.BytesIO('\n'.join(error_cards).encode('utf-8'))
-        await update.message.reply_document(document=error_file, filename=f"@Soenx_err_{timestamp}.txt", caption=f"⚠️ Error Cards ({len(error_cards)})")
+    if approved:
+        app_file = io.BytesIO('\n'.join(approved).encode())
+        await update.message.reply_document(app_file, filename=f"@Soenx_app_{timestamp}.txt", caption=f"✅ Approved ({len(approved)})")
+    if declined:
+        dec_file = io.BytesIO('\n'.join(declined).encode())
+        await update.message.reply_document(dec_file, filename=f"@Soenx_dec_{timestamp}.txt", caption=f"❌ Declined ({len(declined)})")
+    if errors:
+        err_file = io.BytesIO('\n'.join(errors).encode())
+        await update.message.reply_document(err_file, filename=f"@Soenx_err_{timestamp}.txt", caption=f"⚠️ Error ({len(errors)})")
     
     await status_msg.edit_text(result_text[:4000], parse_mode="HTML")
-    
-    update_mass_stats(user, len(cards))
-    
+    await update_mass_stats_fast(user, len(cards))
     user_mass_cooldown[user.id] = time.time()
-    
     await asyncio.sleep(MASS_COOLDOWN)
     mass_checking_active[user.id] = False
 
 async def handle_bin_command(update: Update, context):
     user = update.effective_user
-    register_user(user)
+    await register_user_fast(user)
     
     bin_input = None
-    
     if update.message.reply_to_message:
         bin_input = update.message.reply_to_message.text
     elif context.args:
         bin_input = ' '.join(context.args)
     else:
-        await update.message.reply_text(
-            "<b>Usage:</b>\n<code>/bin 466349</code>\n\n"
-            "<b>Example:</b>\n<code>/bin 466349</code>",
-            parse_mode="HTML"
-        )
+        await update.message.reply_text("<b>Usage:</b>\n<code>/bin 466349</code>", parse_mode="HTML")
         return
     
-    banned, until, reason = is_banned(user.id)
+    banned, until, reason = await is_banned_fast(user.id)
     if banned:
-        await update.message.reply_text(f"⛔ You are temporarily banned.\nReason: {reason}\nBanned until: {until.strftime('%Y-%m-%d %H:%M:%S')}")
+        await update.message.reply_text(f"⛔ Banned")
         return
     
     bin_digits = re.search(r'(\d{6})', bin_input)
     if not bin_digits:
-        await update.message.reply_text("❌ Invalid BIN. Please provide first 6 digits of card.")
+        await update.message.reply_text("❌ Invalid BIN. Provide first 6 digits.")
         return
     
-    bin_num = bin_digits.group(1)
-    
-    if update.message.reply_to_message:
-        msg = await update.message.reply_to_message.reply_text("🔄 Fetching BIN information...")
-    else:
-        msg = await update.message.reply_text("🔄 Fetching BIN information...")
-    
-    result = await get_bin_info(bin_num)
+    msg = await update.message.reply_text("🔄 Fetching BIN info...")
+    result = await get_bin_info_fast(bin_digits.group(1))
     
     if "error" in result:
         formatted = f"<b>❌ Error:</b> {result['error']}"
@@ -1145,166 +892,108 @@ async def handle_bin_command(update: Update, context):
     
     await msg.edit_text(formatted, parse_mode="HTML")
 
-async def userdata(update: Update, context):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ Only owner can use this command.")
-        return
-    
-    csv_data = export_user_data()
-    
-    if not csv_data.strip():
-        await update.message.reply_text("📭 No user data found.")
-        return
-    
-    await update.message.reply_document(
-        document=io.BytesIO(csv_data.encode('utf-8')),
-        filename=f"userdata_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        caption="User Data Export"
-    )
-
-async def hitsfile(update: Update, context):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ Only owner can use this command.")
-        return
-    
-    csv_data = export_approved_cards()
-    
-    if not csv_data.strip():
-        await update.message.reply_text("📭 No approved cards found.")
-        return
-    
-    await update.message.reply_document(
-        document=io.BytesIO(csv_data.encode('utf-8')),
-        filename=f"approved_cards_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        caption="Approved Cards Export"
-    )
-
 # ==================== SESSION MANAGEMENT ====================
-
 async def add_session(update: Update, context):
     if not is_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ Only owner can use this command.")
+        await update.message.reply_text("⛔ Owner only.")
         return
     
     await update.message.reply_text(
-        "📁 Send your Telegram session file (.session)\n\n"
-        "Note: Multiple sessions can be added for load balancing.\n"
-        "Sessions will be rotated automatically.\n\n"
-        "How to get session file:\n"
-        "Use Telethon to generate .session file\n"
-        "Send the .session file directly to this bot"
+        "📁 Send .session file\n\n"
+        "Sessions stay connected for speed\n"
+        "Multiple sessions = load balancing"
     )
 
 async def handle_session_file(update: Update, context):
-    user_id = update.effective_user.id
-    
-    if not is_owner(user_id):
+    if not is_owner(update.effective_user.id):
         return
     
     if not update.message.document:
         return
     
-    document = update.message.document
-    file_name = document.file_name
-    
-    if not file_name.endswith('.session'):
-        await update.message.reply_text("❌ Invalid file type. Send a .session file only.")
+    doc = update.message.document
+    if not doc.file_name.endswith('.session'):
+        await update.message.reply_text("❌ Send .session file only.")
         return
     
-    file_id = document.file_id
-    new_file_name = f"session_{int(time.time())}_{random.randint(1000, 9999)}.session"
-    file_path = os.path.join(SESSION_DIR, new_file_name)
+    file_name = f"session_{int(time.time())}_{random.randint(1000,9999)}.session"
+    file_path = os.path.join(SESSION_DIR, file_name)
     
     try:
-        msg = await update.message.reply_text("🔄 Verifying session file...")
-        
-        file = await context.bot.get_file(file_id)
+        msg = await update.message.reply_text("🔄 Verifying...")
+        file = await context.bot.get_file(doc.file_id)
         await file.download_to_drive(file_path)
         
-        is_valid, info = await verify_session_file(file_path)
+        client = TelegramClient(file_path, API_ID, API_HASH)
+        await client.connect()
         
-        if is_valid:
-            c.execute("INSERT INTO sessions (session_name, phone_number, created_at, is_active) VALUES (?, ?, ?, ?)",
-                      (new_file_name, info, datetime.now(), 1))
-            conn.commit()
-            
-            add_session_to_queue(new_file_name)
-            load_sessions()
-            
-            await msg.edit_text(f"✅ Session added successfully!\n\n📱 Phone: {info}\n📁 File: {new_file_name}\n🔄 Total active sessions: {len(sessions_queue)}\n\nUse /chk to check cards.")
+        if await client.is_user_authorized():
+            me = await client.get_me()
+            await execute_query(
+                "INSERT INTO sessions (session_name, phone_number, created_at, is_active) VALUES (?, ?, ?, ?)",
+                (file_name, me.phone, datetime.now().isoformat(), 1)
+            )
+            session_clients[file_name] = client
+            session_locks[file_name] = asyncio.Lock()
+            sessions_queue.append(file_name)
+            await msg.edit_text(f"✅ Session added!\n📱 {me.phone}\n⚡ Total: {len(sessions_queue)}")
         else:
-            await msg.edit_text(f"❌ Invalid session file!\nError: {info}\n\nSend valid authorized .session file.")
-            if os.path.exists(file_path):
-                os.remove(file_path)
-        
+            await msg.edit_text("❌ Invalid session. Not authorized.")
+            os.remove(file_path)
+            
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}")
         if os.path.exists(file_path):
             os.remove(file_path)
 
-async def list_sessions(update: Update, context):
+async def sessions_list(update: Update, context):
     if not is_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ Only owner can use this command.")
         return
     
-    load_sessions()
-    
-    if not sessions_queue:
-        await update.message.reply_text("📭 No sessions found. Use /add to add session files.")
+    result = await execute_query("SELECT session_name, phone_number, created_at FROM sessions WHERE is_active = 1", fetch_all=True)
+    if not result:
+        await update.message.reply_text("📭 No sessions.")
         return
     
-    try:
-        c.execute("SELECT session_name, phone_number, created_at, is_active FROM sessions WHERE is_active = 1")
-        sessions_data = c.fetchall()
-    except:
-        sessions_data = []
-    
-    if not sessions_data:
-        await update.message.reply_text("No active sessions.")
-        return
-    
-    for session_name, phone, created_at, is_active in sessions_data:
-        status = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
-        await update.message.reply_text(
-            f"<b>Session Details</b>\n\n"
-            f"📱 Phone: {phone}\n"
-            f"📁 File: {session_name}\n"
-            f"📅 Created: {created_at[:19]}\n"
-            f"Status: {status}",
-            parse_mode="HTML"
-        )
-    
-    await update.message.reply_text(f"<b>Total Active Sessions:</b> {len(sessions_queue)}\n<b>Load Balancing:</b> Active", parse_mode="HTML")
+    text = "<b>📁 Active Sessions</b>\n\n"
+    for name, phone, created in result:
+        text += f"📱 {phone}\n📁 {name[:20]}\n📅 {created[:10]}\n\n"
+    text += f"⚡ Total: {len(result)} | Load Balancing: ON"
+    await update.message.reply_text(text, parse_mode="HTML")
 
 async def remove_session(update: Update, context):
     if not is_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ Only owner can use this command.")
         return
     
     if not context.args:
         await update.message.reply_text("Usage: /rm <session_name>")
         return
     
-    session_name = context.args[0]
+    name = context.args[0]
+    await execute_query("DELETE FROM sessions WHERE session_name = ?", (name,))
     
-    try:
-        c.execute("DELETE FROM sessions WHERE session_name = ?", (session_name,))
-        conn.commit()
-        remove_session_from_queue(session_name)
-        
-        session_path = os.path.join(SESSION_DIR, session_name)
-        if os.path.exists(session_path):
-            os.remove(session_path)
-        
-        await update.message.reply_text(f"✅ Session {session_name} removed.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}")
+    if name in session_clients:
+        try:
+            await session_clients[name].disconnect()
+        except:
+            pass
+        del session_clients[name]
+    
+    if name in session_locks:
+        del session_locks[name]
+    
+    if name in sessions_queue:
+        sessions_queue.remove(name)
+    
+    path = os.path.join(SESSION_DIR, name)
+    if os.path.exists(path):
+        os.remove(path)
+    
+    await update.message.reply_text(f"✅ Removed: {name}")
 
 # ==================== OWNER COMMANDS ====================
-
 async def ban_user(update: Update, context):
     if not is_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ Only owner can use this command.")
         return
     
     if not context.args:
@@ -1313,20 +1002,18 @@ async def ban_user(update: Update, context):
     
     try:
         user_id = int(context.args[0])
-        reason = ' '.join(context.args[1:]) if len(context.args) > 1 else "No reason"
-        
-        banned_until = datetime.now() + timedelta(days=36500)
-        c.execute("INSERT OR REPLACE INTO banned_users (user_id, banned_until, reason) VALUES (?, ?, ?)",
-                  (user_id, banned_until.isoformat(), reason))
-        conn.commit()
-        
-        await update.message.reply_text(f"✅ User {user_id} permanently banned.\nReason: {reason}")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid user ID.")
+        reason = ' '.join(context.args[1:]) or "No reason"
+        banned_until = (datetime.now() + timedelta(days=36500)).isoformat()
+        await execute_query(
+            "INSERT OR REPLACE INTO banned_users (user_id, banned_until, reason) VALUES (?, ?, ?)",
+            (user_id, banned_until, reason)
+        )
+        await update.message.reply_text(f"✅ Banned {user_id}")
+    except:
+        await update.message.reply_text("❌ Invalid ID")
 
 async def unban_user(update: Update, context):
     if not is_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ Only owner can use this command.")
         return
     
     if not context.args:
@@ -1335,15 +1022,13 @@ async def unban_user(update: Update, context):
     
     try:
         user_id = int(context.args[0])
-        c.execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
-        conn.commit()
-        await update.message.reply_text(f"✅ User {user_id} unbanned.")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid user ID.")
+        await execute_query("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
+        await update.message.reply_text(f"✅ Unbanned {user_id}")
+    except:
+        await update.message.reply_text("❌ Invalid ID")
 
 async def tban_user(update: Update, context):
     if not is_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ Only owner can use this command.")
         return
     
     if len(context.args) < 2:
@@ -1353,20 +1038,18 @@ async def tban_user(update: Update, context):
     try:
         user_id = int(context.args[0])
         minutes = int(context.args[1])
-        reason = ' '.join(context.args[2:]) if len(context.args) > 2 else "No reason"
-        
-        banned_until = datetime.now() + timedelta(minutes=minutes)
-        c.execute("INSERT OR REPLACE INTO banned_users (user_id, banned_until, reason) VALUES (?, ?, ?)",
-                  (user_id, banned_until.isoformat(), reason))
-        conn.commit()
-        
-        await update.message.reply_text(f"✅ User {user_id} banned for {minutes} minutes.\nReason: {reason}\nUntil: {banned_until.strftime('%Y-%m-%d %H:%M:%S')}")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid user ID or minutes.")
+        reason = ' '.join(context.args[2:]) or "No reason"
+        banned_until = (datetime.now() + timedelta(minutes=minutes)).isoformat()
+        await execute_query(
+            "INSERT OR REPLACE INTO banned_users (user_id, banned_until, reason) VALUES (?, ?, ?)",
+            (user_id, banned_until, reason)
+        )
+        await update.message.reply_text(f"✅ Banned {user_id} for {minutes} minutes")
+    except:
+        await update.message.reply_text("❌ Invalid")
 
 async def reset_user(update: Update, context):
     if not is_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ Only owner can use this command.")
         return
     
     if not context.args:
@@ -1375,14 +1058,17 @@ async def reset_user(update: Update, context):
     
     try:
         user_id = int(context.args[0])
-        reset_user_checks(user_id)
-        await update.message.reply_text(f"✅ User {user_id} limit reset.")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid user ID.")
+        now = datetime.now().isoformat()
+        await execute_query(
+            "UPDATE user_stats SET single_checks_today = 0, mass_checks_today = 0, single_last_reset = ?, mass_last_reset = ? WHERE user_id = ?",
+            (now, now, user_id)
+        )
+        await update.message.reply_text(f"✅ Reset {user_id}")
+    except:
+        await update.message.reply_text("❌ Invalid")
 
 async def increase_limit(update: Update, context):
     if not is_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ Only owner can use this command.")
         return
     
     if len(context.args) < 2:
@@ -1392,196 +1078,203 @@ async def increase_limit(update: Update, context):
     try:
         user_id = int(context.args[0])
         limit = int(context.args[1])
-        set_user_limit(user_id, limit)
-        await update.message.reply_text(f"✅ User {user_id} limit set to {limit} checks per hour.")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid user ID or limit.")
+        await execute_query(
+            "UPDATE user_stats SET custom_limit = ? WHERE user_id = ?",
+            (limit, user_id)
+        )
+        await update.message.reply_text(f"✅ User {user_id} limit = {limit}")
+    except:
+        await update.message.reply_text("❌ Invalid")
 
 async def set_delay_cmd(update: Update, context):
     if not is_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ Only owner can use this command.")
         return
     
     if not context.args:
-        current = get_delay()
-        await update.message.reply_text(f"⏱️ Current delay: {current} seconds\nUsage: /delay <seconds>")
+        current = await get_delay_fast()
+        await update.message.reply_text(f"⏱️ Current delay: {current}s")
         return
     
     try:
         seconds = int(context.args[0])
-        if seconds < 0:
-            await update.message.reply_text("❌ Delay cannot be negative.")
-            return
-        set_delay(seconds)
-        await update.message.reply_text(f"✅ Delay set to {seconds} seconds.")
-    except ValueError:
-        await update.message.reply_text("❌ Provide valid number.")
+        await execute_query("UPDATE bot_config SET value = ? WHERE key = 'check_delay'", (str(seconds),))
+        await update.message.reply_text(f"✅ Delay = {seconds}s")
+    except:
+        await update.message.reply_text("❌ Invalid")
 
-async def set_approved_channel_cmd(update: Update, context):
+async def set_channel(update: Update, context):
     if not is_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ Only owner can use this command.")
         return
     
     if not context.args:
-        current = get_approved_channel()
-        await update.message.reply_text(f"📢 Current approved channel: {current or 'Not set'}\nUsage: /setchannel <channel_id or @username>")
+        current = await get_approved_channel_fast()
+        await update.message.reply_text(f"📢 Current channel: {current or 'Not set'}")
         return
     
     channel = context.args[0]
-    set_approved_channel(channel)
-    await update.message.reply_text(f"✅ Approved cards will be sent to: {channel}")
+    await execute_query(
+        "INSERT OR REPLACE INTO admin_config (key, value) VALUES ('approved_channel', ?)",
+        (channel,)
+    )
+    await update.message.reply_text(f"✅ Approved cards → {channel}")
 
 async def broadcast(update: Update, context):
     if not is_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ Only owner can use this command.")
         return
     
     if not context.args and not update.message.reply_to_message:
-        await update.message.reply_text("Usage: /broadcast <message> or reply to a message")
+        await update.message.reply_text("Usage: /broadcast <msg>")
         return
     
-    if update.message.reply_to_message:
-        msg = update.message.reply_to_message.text
-    else:
-        msg = ' '.join(context.args)
-    
+    msg = update.message.reply_to_message.text if update.message.reply_to_message else ' '.join(context.args)
     if not msg:
-        await update.message.reply_text("❌ Message cannot be empty.")
         return
     
-    try:
-        c.execute("SELECT DISTINCT user_id FROM user_stats")
-        users = c.fetchall()
-    except:
-        users = []
-    
+    users = await execute_query("SELECT DISTINCT user_id FROM user_stats", fetch_all=True)
     success = 0
-    fail = 0
-    
-    status_msg = await update.message.reply_text(f"📢 Sending to {len(users)} users...")
+    status = await update.message.reply_text(f"📢 Sending to {len(users)} users...")
     
     for user in users:
         try:
-            await context.bot.send_message(user[0], f"📢 Broadcast from Owner:\n\n{msg}")
+            await context.bot.send_message(user[0], f"📢 Broadcast:\n\n{msg}")
             success += 1
         except:
-            fail += 1
-        await asyncio.sleep(0.05)
+            pass
+        await asyncio.sleep(0.02)
     
-    await status_msg.edit_text(f"✅ Broadcast done!\nSent: {success}\nFailed: {fail}")
+    await status.edit_text(f"✅ Sent to {success}/{len(users)} users")
 
-async def stats(update: Update, context):
+async def stats_cmd(update: Update, context):
     if not is_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ Only owner can use this command.")
         return
     
-    total_users, total_checks = get_all_stats()
-    active_sessions = len(sessions_queue)
-    current_delay = get_delay()
+    total_users = await execute_query("SELECT COUNT(*) FROM user_stats", fetch_one=True)
+    total_checks = await execute_query("SELECT SUM(total_checks) FROM user_stats", fetch_one=True)
     
-    stats_text = (
-        "<b>📊 Bot Statistics</b>\n\n"
-        f"👥 Total Users: {total_users}\n"
-        f"🔍 Total Checks: {total_checks}\n"
-        f"📁 Active Sessions: {active_sessions}\n"
-        f"⏱️ Check Delay: {current_delay} seconds\n"
-        f"📦 Max Mass Limit: {MAX_MASS_LIMIT} cards\n"
-        f"⏰ Mass Cooldown: {MASS_COOLDOWN} seconds\n"
-        "🟢 Bot Status: Online"
+    text = (
+        f"<b>📊 Bot Stats</b>\n\n"
+        f"👥 Users: {total_users[0] or 0}\n"
+        f"🔍 Checks: {total_checks[0] or 0}\n"
+        f"📁 Sessions: {len(sessions_queue)}\n"
+        f"⚡ Concurrent: {MAX_CONCURRENT_CHECKS}\n"
+        f"🟢 Status: Online"
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
+
+async def userdata(update: Update, context):
+    if not is_owner(update.effective_user.id):
+        return
+    
+    users = await execute_query(
+        "SELECT user_id, first_name, username, total_checks, single_checks_today, mass_checks_today, join_date FROM user_stats",
+        fetch_all=True
     )
     
-    await update.message.reply_text(stats_text, parse_mode="HTML")
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['User ID', 'Name', 'Username', 'Total Checks', 'Single Today', 'Mass Today', 'Join Date'])
+    writer.writerows(users)
+    output.seek(0)
+    
+    await update.message.reply_document(
+        io.BytesIO(output.getvalue().encode()),
+        filename=f"users_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    )
+
+async def hitsfile(update: Update, context):
+    if not is_owner(update.effective_user.id):
+        return
+    
+    cards = await execute_query(
+        "SELECT card_data, status, response, checked_at FROM approved_cards ORDER BY checked_at DESC LIMIT 1000",
+        fetch_all=True
+    )
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['Card', 'Status', 'Response', 'Time'])
+    writer.writerows(cards)
+    output.seek(0)
+    
+    await update.message.reply_document(
+        io.BytesIO(output.getvalue().encode()),
+        filename=f"approved_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    )
 
 async def owner_menu(update: Update, context):
     if not is_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ Only owner can use this command.")
         return
     
-    commands = (
+    text = (
         "<b>👑 Owner Commands</b>\n\n"
-        "<b>📁 Session Management</b>\n"
-        "/add - Add session file\n"
-        "/sessions - View all sessions\n"
-        "/rm <name> - Remove session\n\n"
-        "<b>⚙️ Bot Settings</b>\n"
-        "/delay <sec> - Set delay\n"
-        "/reset <user_id> - Reset user limit\n"
-        "/increase <user_id> <limit> - Set user limit\n"
-        "/setchannel <channel> - Set approved channel\n\n"
-        "<b>🔨 User Management</b>\n"
-        "/ban <user_id> [reason] - Permanent ban\n"
-        "/unban <user_id> - Unban user\n"
-        "/tban <user_id> <minutes> [reason] - Temp ban\n\n"
+        "<b>📁 Sessions</b>\n"
+        "/add - Add session\n"
+        "/sessions - List sessions\n"
+        "/rm &lt;name&gt; - Remove\n\n"
+        "<b>⚙️ Settings</b>\n"
+        "/delay &lt;sec&gt; - Set delay\n"
+        "/reset &lt;id&gt; - Reset user\n"
+        "/increase &lt;id&gt; &lt;limit&gt; - Set limit\n"
+        "/setchannel &lt;channel&gt; - Approve channel\n\n"
+        "<b>🔨 Moderation</b>\n"
+        "/ban &lt;id&gt; [reason]\n"
+        "/unban &lt;id&gt;\n"
+        "/tban &lt;id&gt; &lt;min&gt;\n\n"
         "<b>📢 Broadcast</b>\n"
-        "/broadcast <msg> - Broadcast message\n\n"
-        "<b>📊 Data & Stats</b>\n"
-        "/userdata - Export user data\n"
-        "/hitsfile - Export approved cards\n"
-        "/stats - Show statistics"
+        "/broadcast &lt;msg&gt;\n\n"
+        "<b>📊 Data</b>\n"
+        "/userdata - Export users\n"
+        "/hitsfile - Export approved\n"
+        "/stats - Statistics"
     )
-    
-    await update.message.reply_text(commands, parse_mode="HTML")
+    await update.message.reply_text(text, parse_mode="HTML")
 
-# ==================== CALLBACK HANDLERS ====================
-
+# ==================== CALLBACKS ====================
 async def button_callback(update: Update, context):
     query = update.callback_query
     await query.answer()
     
     if query.data == "profile":
         user = update.effective_user
-        username = user.username if user.username else 'No username'
-        single_checks = get_single_check_count(user.id)
-        mass_checks = get_mass_check_count(user.id)
-        user_limit = get_user_limit(user.id)
+        single = await get_single_check_count_fast(user.id)
+        mass = await get_mass_check_count_fast(user.id)
+        limit = await get_user_limit_fast(user.id)
         
-        keyboard = [[InlineKeyboardButton("Back", callback_data="back_to_cmds")]]
-        
-        await query.edit_message_text(
+        text = (
             f"<b>User ID</b> • <code>{user.id}</code>\n"
             f"<b>Name</b> • {user.full_name}\n"
-            f"<b>Username</b> • @{username}\n"
-            f"<b>First Name</b> • {user.first_name}\n"
-            f"<b>Single Checks Today</b> • {single_checks}/{user_limit}\n"
-            f"<b>Mass Checks Today</b> • {mass_checks}/{MAX_MASS_CHECKS_PER_HOUR}",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            f"<b>Single Checks</b> • {single}/{limit}\n"
+            f"<b>Mass Checks</b> • {mass}/{MAX_MASS_CHECKS_PER_HOUR}"
         )
+        keyboard = [[InlineKeyboardButton("Back", callback_data="back_to_cmds")]]
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
     
     elif query.data == "rules":
+        text = "<b>Rules:</b>\n\n1. Same card 5 times in 2 minutes = 5 min ban"
         keyboard = [[InlineKeyboardButton("Back", callback_data="back_to_cmds")]]
-        
-        await query.edit_message_text(
-            "<b>Rules:</b>\n\n<b>1.</b> Attempting more than 5 transactions with the same card within a minute will lead to a ban.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
     
     elif query.data == "back_to_cmds":
         keyboard = [
             [InlineKeyboardButton("Profile", callback_data="profile")],
             [InlineKeyboardButton("Rules", callback_data="rules")]
         ]
-        
-        await query.edit_message_text(
-            "<b>Auth</b>\n• /chk - Stripe Auth\n\n<b>Charge</b>\n• /ss - Stripe+Square $0.001(trail)\n\n<b>Mass</b>\n• /mchk - Stripe Auth Mass\n\n<b>Other</b>\n• /bin - BIN/IIN Check\n• /rules - Check Bot Rules\n• /info - Your Profile",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-
-# ==================== MESSAGE HANDLERS ====================
-
-async def unknown(update: Update, context):
-    await update.message.reply_text("❌ Unknown command. Use /cmds to see available commands.")
-
-async def handle_message(update: Update, context):
-    await handle_session_file(update, context)
+        text = "<b>Auth</b>\n• /chk - Stripe Auth\n\n<b>Charge</b>\n• /ss - Stripe+Square $0.001\n\n<b>Mass</b>\n• /mchk - Mass Check\n\n<b>Other</b>\n• /bin - BIN Check\n• /rules - Rules\n• /info - Profile"
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 # ==================== MAIN ====================
-
-def main():
-    load_sessions()
+async def main():
+    print("🚀 Starting ULTRA FAST bot...")
     
+    # Initialize database pool
+    await db_pool.initialize()
+    await init_db()
+    
+    # Load sessions
+    session_count = await load_sessions_fast()
+    print(f"📁 Loaded {session_count} sessions")
+    
+    # Build application
     application = Application.builder().token(TOKEN).build()
     
     # User commands
@@ -1600,7 +1293,7 @@ def main():
     # Owner commands
     application.add_handler(CommandHandler("ownermode", owner_menu))
     application.add_handler(CommandHandler("add", add_session))
-    application.add_handler(CommandHandler("sessions", list_sessions))
+    application.add_handler(CommandHandler("sessions", sessions_list))
     application.add_handler(CommandHandler("rm", remove_session))
     application.add_handler(CommandHandler("delay", set_delay_cmd))
     application.add_handler(CommandHandler("reset", reset_user))
@@ -1611,21 +1304,18 @@ def main():
     application.add_handler(CommandHandler("broadcast", broadcast))
     application.add_handler(CommandHandler("userdata", userdata))
     application.add_handler(CommandHandler("hitsfile", hitsfile))
-    application.add_handler(CommandHandler("stats", stats))
-    application.add_handler(CommandHandler("setchannel", set_approved_channel_cmd))
+    application.add_handler(CommandHandler("stats", stats_cmd))
+    application.add_handler(CommandHandler("setchannel", set_channel))
     
     # Callbacks
     application.add_handler(CallbackQueryHandler(button_callback))
     
-    # Message handlers
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_message))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(MessageHandler(filters.COMMAND, unknown))
+    # File handler
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_session_file))
+    application.add_handler(MessageHandler(filters.COMMAND, lambda u,c: u.message.reply_text("❌ Unknown command. Use /cmds")))
     
-    print("🤖 Bot is running...")
-    print(f"👑 Owner ID: {OWNER_ID}")
-    print(f"📁 Sessions loaded: {len(sessions_queue)}")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    print(f"✅ Bot is LIVE! Ready for {len(sessions_queue) * MAX_CONCURRENT_CHECKS}+ concurrent checks")
+    await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
