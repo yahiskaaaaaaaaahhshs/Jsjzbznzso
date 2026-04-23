@@ -14,7 +14,6 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 from telethon import TelegramClient
 from telethon.tl.functions.messages import GetHistoryRequest
 import sqlite3
-from asyncio import Semaphore
 
 # ==================== CONFIG ====================
 TOKEN = "8735764992:AAEMKvlWXyruQj49KLz4IJHIDVU6ophL644"
@@ -57,9 +56,7 @@ c.execute('''CREATE TABLE IF NOT EXISTS sessions
               session_name TEXT UNIQUE,
               phone_number TEXT,
               created_at TIMESTAMP,
-              is_active BOOLEAN DEFAULT 1,
-              is_busy BOOLEAN DEFAULT 0,
-              current_load INTEGER DEFAULT 0)''')
+              is_active BOOLEAN DEFAULT 1)''')
 
 c.execute('''CREATE TABLE IF NOT EXISTS banned_users
              (user_id INTEGER PRIMARY KEY,
@@ -104,7 +101,6 @@ conn.commit()
 
 # Global variables
 sessions_queue = deque()
-session_semaphores = {}
 user_cooldown = {}
 mass_checking_active = {}
 user_mass_cooldown = {}
@@ -127,11 +123,6 @@ def get_user_limit(user_id):
         pass
     return MAX_SINGLE_LIMIT
 
-def get_mass_limit(user_id):
-    if is_owner(user_id):
-        return 999999
-    return MAX_MASS_LIMIT
-
 def get_mass_hour_limit(user_id):
     if is_owner(user_id):
         return 999999
@@ -153,11 +144,9 @@ def is_banned(user_id):
     return False, None, None
 
 def auto_ban_card(card_hash, user_id):
-    """Auto-ban user for 5 minutes if same card used 5 times in 2 minutes"""
     now = datetime.now()
     card_attempts[card_hash].append((now, user_id))
     
-    # Clean old attempts
     card_attempts[card_hash] = [(t, uid) for t, uid in card_attempts[card_hash] if now - t < timedelta(minutes=2)]
     
     user_attempts = [uid for _, uid in card_attempts[card_hash] if uid == user_id]
@@ -307,9 +296,6 @@ def load_sessions():
         c.execute("SELECT session_name FROM sessions WHERE is_active = 1 ORDER BY id")
         sessions = [row[0] for row in c.fetchall()]
         sessions_queue = deque(sessions)
-        for session in sessions:
-            if session not in session_semaphores:
-                session_semaphores[session] = Semaphore(MAX_CONCURRENT_CHECKS)
     except:
         sessions_queue = deque()
     return list(sessions_queue)
@@ -320,12 +306,6 @@ def get_next_session():
         sessions_queue.rotate(-1)
         return session
     return None
-
-def add_session_to_queue(session_name):
-    if session_name not in sessions_queue:
-        sessions_queue.append(session_name)
-        if session_name not in session_semaphores:
-            session_semaphores[session_name] = Semaphore(MAX_CONCURRENT_CHECKS)
 
 def clear_all_sessions():
     global sessions_queue
@@ -339,15 +319,12 @@ def clear_all_sessions():
         c.execute("DELETE FROM sessions")
         conn.commit()
         sessions_queue = deque()
-        session_semaphores.clear()
     except:
         pass
 
 def validate_and_parse_card(card_input):
-    """Flexible card validation supporting multiple formats"""
     card_input = card_input.strip().replace(' ', '')
     
-    # Try format: cc|mm|yy|cvv or cc|mm|yyyy|cvv
     if '|' in card_input or ':' in card_input:
         if '|' in card_input:
             parts = card_input.split('|')
@@ -375,7 +352,6 @@ def validate_and_parse_card(card_input):
             if re.match(r'^\d{15,16}$', card_num) and re.match(r'^\d{2}$', month) and re.match(r'^\d{2}$', year) and re.match(r'^\d{3,4}$', cvv):
                 return True, f"{card_num}|{month}|{year}|{cvv}"
     
-    # Try continuous format: ccmmyycvv
     match = re.search(r'^(\d{15,16})(\d{2})(\d{2})(\d{3,4})$', card_input)
     if match:
         card_num = match.group(1)
@@ -386,7 +362,6 @@ def validate_and_parse_card(card_input):
         if int(month) >= 1 and int(month) <= 12:
             return True, f"{card_num}|{month}|{year}|{cvv}"
     
-    # Try continuous format with 4-digit year
     match = re.search(r'^(\d{15,16})(\d{2})(\d{4})(\d{3,4})$', card_input)
     if match:
         card_num = match.group(1)
@@ -400,9 +375,7 @@ def validate_and_parse_card(card_input):
     return False, None
 
 def parse_multiple_cards(text):
-    """Parse multiple cards from text input - max 10 cards"""
     cards = []
-    
     lines = text.strip().split('\n')
     
     for line in lines:
@@ -413,7 +386,6 @@ def parse_multiple_cards(text):
         if not line:
             continue
         
-        # Try format: cc|mm|yyyy|cvv
         card_match = re.search(r'(\d{15,16})\s*[|:]\s*(\d{1,2})\s*[|:]\s*(\d{2,4})\s*[|:]\s*(\d{3,4})', line)
         if card_match:
             card_num = card_match.group(1)
@@ -429,7 +401,6 @@ def parse_multiple_cards(text):
                 cards.append(f"{card_num}|{month}|{year}|{cvv}")
             continue
         
-        # Try continuous format
         cont_match = re.search(r'(\d{15,16})(\d{2})(\d{2,4})(\d{3,4})', line)
         if cont_match:
             card_num = cont_match.group(1)
@@ -448,11 +419,9 @@ def parse_multiple_cards(text):
     return cards[:MAX_MASS_LIMIT]
 
 def parse_bot_reply(text):
-    """Parse bot response and extract card info"""
     cc_match = re.search(r'CC:\s*(.*?)(?:\n|$)', text)
     status_match = re.search(r'Status:\s*(.*?)(?:\n|$)', text)
     response_match = re.search(r'Response:\s*(.*?)(?:\n|$)', text)
-    gateway_match = re.search(r'Gateway:\s*(.*?)(?:\n|$)', text)
     bank_match = re.search(r'Bank:\s*(.*?)(?:\n|$)', text)
     type_match = re.search(r'Type:\s*(.*?)(?:\n|$)', text)
     country_match = re.search(r'Country:\s*(.*?)(?:\n|$)', text)
@@ -463,7 +432,7 @@ def parse_bot_reply(text):
         "cc": cc_match.group(1).strip() if cc_match else "",
         "status": status,
         "response": response_match.group(1).strip() if response_match else "",
-        "gateway": gateway_match.group(1).strip() if gateway_match else "Stripe",
+        "gateway": "Stripe",
         "bank": bank_match.group(1).strip() if bank_match else "",
         "type": type_match.group(1).strip() if type_match else "",
         "country": country_match.group(1).strip() if country_match else ""
@@ -533,7 +502,6 @@ async def get_bin_info(bin_num):
         return {"error": f"API error: {str(e)}"}
 
 async def send_card_via_session(card_data, session_name):
-    """Send card to bot via Telethon session"""
     session_path = os.path.join(SESSION_DIR, session_name)
     
     client = None
@@ -709,7 +677,6 @@ async def handle_chk_command(update: Update, context):
     
     user_cooldown[user.id] = current_time
     
-    # Auto-ban check for same card
     card_hash = parsed_card.split('|')[0]
     if auto_ban_card(card_hash, user.id):
         await update.message.reply_text("⛔ You have been banned for 5 minutes for using the same card too many times.")
@@ -726,8 +693,7 @@ async def handle_chk_command(update: Update, context):
         await msg.edit_text("❌ No active session available. Owner please use /add to add a session.")
         return
     
-    async with session_semaphores.get(session_name, Semaphore(1)):
-        result = await send_card_via_session(parsed_card, session_name)
+    result = await send_card_via_session(parsed_card, session_name)
     
     if "error" in result:
         if result.get("error") == "timeout":
@@ -748,7 +714,6 @@ async def handle_chk_command(update: Update, context):
         await msg.edit_text(formatted, parse_mode="HTML")
         return
     
-    # Check if approved
     is_approved = 'approved' in result.get('status', '').lower()
     
     if is_approved:
@@ -787,7 +752,6 @@ async def handle_chk_command(update: Update, context):
     update_single_stats(user)
 
 async def handle_ss_command(update: Update, context):
-    """/ss command - Stripe+Square gateway"""
     user = update.effective_user
     register_user(user)
     
@@ -858,8 +822,7 @@ async def handle_ss_command(update: Update, context):
         await msg.edit_text("❌ No active session available. Owner please use /add to add a session.")
         return
     
-    async with session_semaphores.get(session_name, Semaphore(1)):
-        result = await send_card_via_session(parsed_card, session_name)
+    result = await send_card_via_session(parsed_card, session_name)
     
     if "error" in result:
         if result.get("error") == "timeout":
@@ -918,16 +881,13 @@ async def handle_ss_command(update: Update, context):
     update_single_stats(user)
 
 async def handle_mchk_command(update: Update, context):
-    """/mchk command - Mass check multiple cards (max 10)"""
     user = update.effective_user
     register_user(user)
     
-    # Check if user already has active mass check
     if user.id in mass_checking_active and mass_checking_active[user.id]:
         await update.message.reply_text("⏳ You already have an active mass check. Please wait for it to complete.\nAfter complete, wait 15 seconds before starting new mass check.", parse_mode="HTML")
         return
     
-    # Check mass cooldown
     if user.id in user_mass_cooldown:
         elapsed = time.time() - user_mass_cooldown[user.id]
         if elapsed < MASS_COOLDOWN:
@@ -935,12 +895,10 @@ async def handle_mchk_command(update: Update, context):
             await update.message.reply_text(f"⏳ Please wait {wait_time} seconds before starting a new mass check.", parse_mode="HTML")
             return
     
-    # Get card input
     card_text = None
     
     if update.message.reply_to_message:
         if update.message.reply_to_message.document:
-            # Handle file
             file = await context.bot.get_file(update.message.reply_to_message.document.file_id)
             file_content = await file.download_as_bytearray()
             card_text = file_content.decode('utf-8', errors='ignore')
@@ -960,7 +918,6 @@ async def handle_mchk_command(update: Update, context):
         )
         return
     
-    # Parse cards
     cards = parse_multiple_cards(card_text)
     
     if not cards:
@@ -971,13 +928,11 @@ async def handle_mchk_command(update: Update, context):
         await update.message.reply_text(f"❌ Max {MAX_MASS_LIMIT} cards per mass check. You sent {len(cards)} cards.\nFirst {MAX_MASS_LIMIT} cards will be checked.", parse_mode="HTML")
         cards = cards[:MAX_MASS_LIMIT]
     
-    # Check ban
     banned, until, reason = is_banned(user.id)
     if banned:
         await update.message.reply_text(f"⛔ You are temporarily banned.\nReason: {reason}\nBanned until: {until.strftime('%Y-%m-%d %H:%M:%S')}")
         return
     
-    # Check mass hour limit
     mass_checks_done = get_mass_check_count(user.id)
     mass_hour_limit = get_mass_hour_limit(user.id)
     
@@ -989,12 +944,10 @@ async def handle_mchk_command(update: Update, context):
         )
         return
     
-    # Check if sessions available
     if not sessions_queue:
         await update.message.reply_text("❌ No active sessions available. Owner please use /add to add a session.")
         return
     
-    # Start mass check
     mass_checking_active[user.id] = True
     
     status_msg = await update.message.reply_text(
@@ -1016,25 +969,21 @@ async def handle_mchk_command(update: Update, context):
     checked = 0
     
     for i, card in enumerate(cards):
-        # Check if user cancelled
         if user.id not in mass_checking_active or not mass_checking_active[user.id]:
             await status_msg.edit_text("⏹️ Mass check cancelled by user.", parse_mode="HTML")
             break
         
-        # Auto-ban check
         card_hash = card.split('|')[0]
         if auto_ban_card(card_hash, user.id):
             results.append({"card": card, "status": "Banned", "response": "User banned for same card spam"})
             error_cards.append(card)
         else:
-            # Get session and check
             session_name = get_next_session()
             if not session_name:
                 results.append({"card": card, "status": "Error", "response": "No session available"})
                 error_cards.append(card)
             else:
-                async with session_semaphores.get(session_name, Semaphore(1)):
-                    result = await send_card_via_session(card, session_name)
+                result = await send_card_via_session(card, session_name)
                 
                 if "error" in result:
                     results.append({"card": card, "status": "Error", "response": result.get('error', 'Unknown')})
@@ -1043,10 +992,7 @@ async def handle_mchk_command(update: Update, context):
                     results.append({
                         "card": card,
                         "status": result.get('status', 'N/A'),
-                        "response": result.get('response', 'N/A'),
-                        "bank": result.get('bank', 'N/A'),
-                        "type": result.get('type', 'N/A'),
-                        "country": result.get('country', 'N/A')
+                        "response": result.get('response', 'N/A')
                     })
                     
                     if 'approved' in result.get('status', '').lower():
@@ -1060,7 +1006,6 @@ async def handle_mchk_command(update: Update, context):
         checked = i + 1
         remaining = len(cards) - checked
         
-        # Update progress
         await status_msg.edit_text(
             f"<b>Cards:</b> {len(cards)}\n"
             f"<b>Checking:</b> {checked}/{len(cards)}\n"
@@ -1073,10 +1018,8 @@ async def handle_mchk_command(update: Update, context):
             parse_mode="HTML"
         )
         
-        # Small delay between cards
         await asyncio.sleep(0.5)
     
-    # Send results
     result_text = f"<b>☇ Mass Check Results</b>\n"
     result_text += f"<b>· · · · · · · · · · · · · · ·</b>\n"
     
@@ -1086,7 +1029,6 @@ async def handle_mchk_command(update: Update, context):
         result_text += f"<b>ヾ⌿ Response:</b> {res.get('response', 'N/A')}\n"
         result_text += f"<b>· · · · · · · · · · · · · · ·</b>\n"
     
-    # Send text files if any
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     
     if approved_cards:
@@ -1103,13 +1045,10 @@ async def handle_mchk_command(update: Update, context):
     
     await status_msg.edit_text(result_text[:4000], parse_mode="HTML")
     
-    # Update stats
     update_mass_stats(user, len(cards))
     
-    # Set cooldown
     user_mass_cooldown[user.id] = time.time()
     
-    # Clear active flag after cooldown
     await asyncio.sleep(MASS_COOLDOWN)
     mass_checking_active[user.id] = False
 
@@ -1247,7 +1186,6 @@ async def handle_session_file(update: Update, context):
                       (new_file_name, info, datetime.now(), 1))
             conn.commit()
             
-            add_session_to_queue(new_file_name)
             load_sessions()
             
             await msg.edit_text(f"✅ Session added successfully!\n\n📱 Phone: {info}\n📁 File: {new_file_name}\n🔄 Total active sessions: {len(sessions_queue)}\n\nUse /chk to check cards.")
@@ -1309,7 +1247,9 @@ async def remove_session(update: Update, context):
     try:
         c.execute("DELETE FROM sessions WHERE session_name = ?", (session_name,))
         conn.commit()
-        remove_session_from_queue(session_name)
+        
+        if session_name in sessions_queue:
+            sessions_queue.remove(session_name)
         
         session_path = os.path.join(SESSION_DIR, session_name)
         if os.path.exists(session_path):
@@ -1601,22 +1541,21 @@ async def handle_message(update: Update, context):
 def main():
     load_sessions()
     
+    # Create application
     application = Application.builder().token(TOKEN).build()
     
-    # User commands
+    # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("profile", profile))
     application.add_handler(CommandHandler("cmds", cmds))
     application.add_handler(CommandHandler("rules", rules))
     application.add_handler(CommandHandler("info", info))
-    
-    # Main commands
     application.add_handler(CommandHandler("chk", handle_chk_command))
     application.add_handler(CommandHandler("ss", handle_ss_command))
     application.add_handler(CommandHandler("mchk", handle_mchk_command))
     application.add_handler(CommandHandler("bin", handle_bin_command))
     
-    # Owner commands
+    # Owner handlers
     application.add_handler(CommandHandler("ownermode", owner_menu))
     application.add_handler(CommandHandler("add", add_session))
     application.add_handler(CommandHandler("sessions", list_sessions))
@@ -1633,18 +1572,18 @@ def main():
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("setchannel", set_approved_channel_cmd))
     
-    # Callbacks
+    # Callbacks and messages
     application.add_handler(CallbackQueryHandler(button_callback))
-    
-    # Message handlers
     application.add_handler(MessageHandler(filters.Document.ALL, handle_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.COMMAND, unknown))
     
-    print("🤖 Bot is running...")
+    print("🤖 Bot is starting...")
     print(f"👑 Owner ID: {OWNER_ID}")
     print(f"📁 Sessions loaded: {len(sessions_queue)}")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+    # Start bot
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
